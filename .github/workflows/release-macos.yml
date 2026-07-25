@@ -1,0 +1,77 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build ad-hoc Universal DMG
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out desktop client
+        uses: actions/checkout@v4
+
+      - name: Check out Kubecode Runtime
+        uses: actions/checkout@v4
+        with:
+          repository: Bayes-Cluster/kubecode
+          path: runtime
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Install Runtime dependencies
+        working-directory: runtime
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="$(plutil -extract CFBundleShortVersionString raw -o - apps/apple/Packaging/Info.plist)"
+          test "${RELEASE_TAG}" = "v${version}" || {
+            echo "Tag ${RELEASE_TAG} does not match Info.plist version ${version}" >&2
+            exit 1
+          }
+
+      - name: Run Apple tests
+        run: |
+          swift test --package-path apps/apple
+          scripts/test-apple-release-pipeline.sh
+          scripts/test-apple-adhoc-release.sh
+
+      - name: Build ad-hoc Universal app
+        env:
+          KUBECODE_RUNTIME_REPO: ${{ github.workspace }}/runtime
+        run: scripts/build-apple-app.sh
+
+      - name: Package ad-hoc DMG
+        run: scripts/package-apple-adhoc-dmg.sh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "${RELEASE_TAG}" \
+            dist/apple/releases/Kubecode-*-universal-adhoc.dmg \
+            dist/apple/releases/Kubecode-*-universal-adhoc.dmg.sha256 \
+            --title "Kubecode Desktop ${RELEASE_TAG}" \
+            --generate-notes \
+            --notes "This build is ad-hoc signed and is not notarized by Apple. On first launch, macOS may require approval in System Settings > Privacy & Security."

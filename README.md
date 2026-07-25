@@ -89,6 +89,19 @@ KUBECODE_NOTARY_PROFILE="kubecode-notary" \
 ordering without credentials. The real release and clean-machine evidence
 workflow is documented in `docs/qa/MACOS_RELEASE.md`.
 
+Without an Apple Developer Program membership, package the default ad-hoc
+signed build for a GitHub Release with:
+
+```bash
+scripts/build-apple-app.sh
+scripts/package-apple-adhoc-dmg.sh
+```
+
+Pushing a version tag such as `v0.1.0` runs
+`.github/workflows/release-macos.yml` and publishes the DMG plus its SHA-256
+checksum. This distribution is not notarized, so Gatekeeper may require the
+user to approve its first launch in System Settings > Privacy & Security.
+
 Local Project selection uses `NSOpenPanel` and persists an opaque
 security-scoped bookmark by Project ID. Remote Server profiles keep using the
 Runtime directory browser because those paths belong to the remote host.
