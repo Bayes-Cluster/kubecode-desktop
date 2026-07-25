@@ -94,4 +94,38 @@ struct ComposerCapabilityTests {
             commands: commands
         ).isEmpty)
     }
+
+    @Test func deleting_a_provisional_slash_completion_suppresses_recompletion() {
+        #expect(ComposerCommandCompletion.isDeletion(
+            affectedRange: NSRange(location: 1, length: 3),
+            replacementString: ""
+        ))
+        #expect(!ComposerCommandCompletion.isDeletion(
+            affectedRange: NSRange(location: 1, length: 0),
+            replacementString: "mcp"
+        ))
+        #expect(!ComposerCommandCompletion.isDeletion(
+            affectedRange: NSRange(location: 1, length: 3),
+            replacementString: "/status"
+        ))
+    }
+
+    @Test func native_draft_deletion_is_not_overwritten_by_a_stale_swiftui_update() {
+        #expect(!ComposerDraftSynchronization.shouldApplyExternalText("/", lastNativeText: "/"))
+        #expect(!ComposerDraftSynchronization.shouldApplyExternalText("", lastNativeText: ""))
+        #expect(ComposerDraftSynchronization.shouldApplyExternalText("/review ", lastNativeText: "/"))
+    }
+
+    @Test func external_composer_insertions_preserve_or_clamp_the_native_selection() {
+        #expect(ComposerDraftSynchronization.selectionAfterExternalUpdate(
+            previousSelection: NSRange(location: 1, length: 0),
+            previousUTF16Length: 1,
+            newUTF16Length: 8
+        ) == NSRange(location: 8, length: 0))
+        #expect(ComposerDraftSynchronization.selectionAfterExternalUpdate(
+            previousSelection: NSRange(location: 4, length: 3),
+            previousUTF16Length: 10,
+            newUTF16Length: 5
+        ) == NSRange(location: 4, length: 1))
+    }
 }

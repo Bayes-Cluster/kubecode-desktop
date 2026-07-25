@@ -429,6 +429,7 @@
 "This Agent does not advertise provider-native Leader options." = "This Agent does not advertise provider-native Leader options.";
 "Thought" = "Thought";
 "Tool" = "Tool";
+"Tool Use" = "Tool Use";
 "Version: %@" = "Version: %@";
 "Working Tree" = "Working Tree";
 "HTTPS endpoint is invalid." = "HTTPS endpoint is invalid.";

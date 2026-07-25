@@ -1517,9 +1517,9 @@ struct ContentView: View {
                                 .disabled(model.isLoadingEarlierHistory)
                                 .frame(maxWidth: .infinity)
                             }
-                            ForEach(model.transcript) { item in
-                                transcriptRow(item)
-                                    .id(item.id)
+                            ForEach(TranscriptPresentationEntry.groupingTools(in: model.transcript)) { entry in
+                                transcriptPresentationRow(entry)
+                                    .id(entry.id)
                             }
                             ForEach(model.interaction.sideQuestions) { question in
                                 sideQuestionCard(question)
@@ -1999,33 +1999,6 @@ struct ContentView: View {
             && !ElicitationResponseBuilder.isValid(property, answer: answer)
     }
 
-    private func toolCard(_ tool: ToolActivity) -> some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 8) {
-                if let input = tool.input, !input.isEmpty {
-                    Text("Input").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text(input).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                }
-                if let output = tool.output, !output.isEmpty {
-                    Text("Output").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    Text(output).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                }
-            }
-            .padding(.top, 6)
-        } label: {
-            HStack {
-                Image(systemName: "wrench.and.screwdriver")
-                Text(tool.title).lineLimit(1)
-                Spacer()
-                Text(tool.status.replacingOccurrences(of: "_", with: " ").capitalized)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(10)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
-    }
-
     private func sideQuestionCard(_ question: SideQuestion) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Label("Side question", systemImage: "bubble.left.and.bubble.right")
@@ -2090,6 +2063,16 @@ struct ContentView: View {
     }
 
     @ViewBuilder
+    private func transcriptPresentationRow(_ entry: TranscriptPresentationEntry) -> some View {
+        switch entry {
+        case let .item(item):
+            transcriptRow(item)
+        case let .tools(_, tools):
+            ToolUseTranscriptGroup(items: tools)
+        }
+    }
+
+    @ViewBuilder
     private func transcriptRow(_ item: TranscriptItem) -> some View {
         switch item.role {
         case .user:
@@ -2120,28 +2103,7 @@ struct ContentView: View {
                 isStreaming: model.activeRun?.id == item.runID
             )
         case .tool:
-            DisclosureGroup {
-                if let detail = item.detail {
-                    Text(detail)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 6)
-                }
-            } label: {
-                HStack {
-                    Image(systemName: "wrench.and.screwdriver")
-                    Text(item.text).lineLimit(1)
-                    Spacer()
-                    Text((item.status ?? "pending").replacingOccurrences(of: "_", with: " ").capitalized)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(10)
-            .frame(maxWidth: 720, alignment: .leading)
-            .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
+            ToolUseTranscriptGroup(items: [item])
         case .system:
             VStack(alignment: .leading, spacing: 5) {
                 Label("Error", systemImage: "exclamationmark.triangle")
@@ -3215,6 +3177,42 @@ struct ContentView: View {
     }
 }
 
+enum TranscriptPresentationEntry: Identifiable, Hashable {
+    case item(TranscriptItem)
+    case tools(id: String, items: [TranscriptItem])
+
+    var id: String {
+        switch self {
+        case let .item(item): item.id
+        case let .tools(id, _): id
+        }
+    }
+
+    static func groupingTools(in items: [TranscriptItem]) -> [TranscriptPresentationEntry] {
+        var entries: [TranscriptPresentationEntry] = []
+        var index = items.startIndex
+        while index < items.endIndex {
+            let item = items[index]
+            guard item.role == .tool else {
+                entries.append(.item(item))
+                index = items.index(after: index)
+                continue
+            }
+
+            var tools: [TranscriptItem] = []
+            let runID = item.runID
+            while index < items.endIndex,
+                  items[index].role == .tool,
+                  items[index].runID == runID {
+                tools.append(items[index])
+                index = items.index(after: index)
+            }
+            entries.append(.tools(id: tools[0].id, items: tools))
+        }
+        return entries
+    }
+}
+
 private struct UserMessageBubble: View {
     @Environment(\.workspaceTypography) private var typography
     let source: String
@@ -3259,5 +3257,56 @@ private struct ThinkingTranscriptRow: View {
         .onChange(of: isStreaming) { _, streaming in
             isExpanded = streaming
         }
+    }
+}
+
+private struct ToolUseTranscriptGroup: View {
+    let items: [TranscriptItem]
+    @State private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(items) { item in
+                    ToolUseTranscriptRow(item: item)
+                }
+            }
+            .padding(.top, 6)
+        } label: {
+            Label("Tool Use", systemImage: "wrench.and.screwdriver")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: 760, alignment: .leading)
+    }
+}
+
+private struct ToolUseTranscriptRow: View {
+    let item: TranscriptItem
+    @State private var isExpanded = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            if let detail = item.detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 6)
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "wrench.and.screwdriver")
+                Text(item.text)
+                    .lineLimit(1)
+                Spacer()
+                Text((item.status ?? "pending").replacingOccurrences(of: "_", with: " ").capitalized)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
     }
 }

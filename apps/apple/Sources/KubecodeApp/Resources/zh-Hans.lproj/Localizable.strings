@@ -429,6 +429,7 @@
 "This Agent does not advertise provider-native Leader options." = "此 Agent 未提供 provider 原生的 Leader 选项。";
 "Thought" = "思考过程";
 "Tool" = "工具";
+"Tool Use" = "工具调用";
 "Version: %@" = "版本：%@";
 "Working Tree" = "工作区更改";
 "HTTPS endpoint is invalid." = "HTTPS 地址无效。";

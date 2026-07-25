@@ -55,6 +55,10 @@ enum ComposerPresentationMetrics {
 }
 
 enum ComposerCommandCompletion {
+    static func isDeletion(affectedRange: NSRange, replacementString: String?) -> Bool {
+        affectedRange.length > 0 && replacementString?.isEmpty == true
+    }
+
     static func range(in text: String, caretUTF16Location: Int) -> NSRange? {
         let utf16Count = text.utf16.count
         guard caretUTF16Location > 0,
@@ -83,6 +87,26 @@ enum ComposerCommandCompletion {
                     options: [.anchored, .caseInsensitive, .diacriticInsensitive]
                 ) != nil
             }
+    }
+}
+
+enum ComposerDraftSynchronization {
+    static func shouldApplyExternalText(_ externalText: String, lastNativeText: String) -> Bool {
+        externalText != lastNativeText
+    }
+
+    static func selectionAfterExternalUpdate(
+        previousSelection: NSRange,
+        previousUTF16Length: Int,
+        newUTF16Length: Int
+    ) -> NSRange {
+        if previousSelection.length == 0,
+           previousSelection.location == previousUTF16Length {
+            return NSRange(location: newUTF16Length, length: 0)
+        }
+        let location = min(previousSelection.location, newUTF16Length)
+        let length = min(previousSelection.length, newUTF16Length - location)
+        return NSRange(location: location, length: length)
     }
 }
 
@@ -244,6 +268,9 @@ struct NativeComposerTextView: NSViewRepresentable {
         textView.allowsUndo = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isContinuousSpellCheckingEnabled = false
         textView.font = typography.composerFont
         textView.textColor = .labelColor
         textView.textContainerInset = NSSize(width: 0, height: 6)
@@ -286,8 +313,19 @@ struct NativeComposerTextView: NSViewRepresentable {
         if textView.font != typography.composerFont {
             textView.font = typography.composerFont
         }
-        if textView.string != text {
+        if ComposerDraftSynchronization.shouldApplyExternalText(
+            text,
+            lastNativeText: context.coordinator.lastNativeText
+        ) {
+            let previousLength = textView.string.utf16.count
+            let previousSelection = textView.selectedRange()
+            context.coordinator.lastNativeText = text
             textView.string = text
+            textView.setSelectedRange(ComposerDraftSynchronization.selectionAfterExternalUpdate(
+                previousSelection: previousSelection,
+                previousUTF16Length: previousLength,
+                newUTF16Length: text.utf16.count
+            ))
         }
         (scrollView as? ComposerScrollView)?.scheduleMeasurement()
     }
@@ -296,17 +334,41 @@ struct NativeComposerTextView: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: NativeComposerTextView
         weak var textView: NSTextView?
-        private var completionRequestPending = false
+        var lastNativeText: String
+        private(set) var completionRequestPending = false
+        private var suppressNextCompletion = false
+        private var completionGeneration = 0
 
         init(parent: NativeComposerTextView) {
             self.parent = parent
+            lastNativeText = parent.text
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView else { return }
+            lastNativeText = textView.string
             parent.text = textView.string
             updateHeight()
+            if suppressNextCompletion {
+                suppressNextCompletion = false
+                return
+            }
             requestCommandCompletion(for: textView)
+        }
+
+        func textView(
+            _ textView: NSTextView,
+            shouldChangeTextIn affectedCharRange: NSRange,
+            replacementString: String?
+        ) -> Bool {
+            if ComposerCommandCompletion.isDeletion(
+                affectedRange: affectedCharRange,
+                replacementString: replacementString
+            ) {
+                suppressNextCompletion = true
+                completionGeneration += 1
+            }
+            return true
         }
 
         private func requestCommandCompletion(for textView: NSTextView) {
@@ -318,15 +380,26 @@ struct NativeComposerTextView: NSViewRepresentable {
                   ).isEmpty
             else { return }
             completionRequestPending = true
+            let generation = completionGeneration
             DispatchQueue.main.async { [weak self, weak textView] in
                 defer { self?.completionRequestPending = false }
-                guard let textView, textView.window?.firstResponder === textView else { return }
+                guard let self,
+                      generation == self.completionGeneration,
+                      let textView,
+                      textView.window?.firstResponder === textView,
+                      !ComposerCommandCompletion.candidates(
+                        in: textView.string,
+                        caretUTF16Location: textView.selectedRange().location,
+                        commands: self.parent.commands
+                      ).isEmpty
+                else { return }
                 textView.complete(nil)
             }
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
+            guard !textView.hasMarkedText() else { return false }
             let modifiers = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
             if modifiers.contains(.shift) {
                 textView.insertNewlineIgnoringFieldEditor(nil)

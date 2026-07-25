@@ -764,6 +764,67 @@ struct TranscriptRenderingTests {
         #expect(measuredHeight == ComposerHeightCalculator.maximumHeight)
     }
 
+    @Test @MainActor func native_composer_disables_smart_replacements_for_code_and_paths() throws {
+        var text = ""
+        var measuredHeight = ComposerHeightCalculator.minimumHeight
+        let controller = NSHostingController(rootView: NativeComposerTextView(
+            text: Binding(get: { text }, set: { text = $0 }),
+            height: Binding(get: { measuredHeight }, set: { measuredHeight = $0 }),
+            onSubmit: {}
+        ).frame(width: 320, height: ComposerHeightCalculator.minimumHeight))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 72),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        window.layoutIfNeeded()
+        controller.view.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let textView = try #require(descendant(of: ComposerTextView.self, in: controller.view))
+
+        #expect(!textView.isAutomaticQuoteSubstitutionEnabled)
+        #expect(!textView.isAutomaticDashSubstitutionEnabled)
+        #expect(!textView.isAutomaticTextReplacementEnabled)
+        #expect(!textView.isAutomaticSpellingCorrectionEnabled)
+        #expect(!textView.isContinuousSpellCheckingEnabled)
+    }
+
+    @Test @MainActor func deleting_a_provisional_command_does_not_immediately_restore_it() {
+        var draft = "/mcp"
+        var measuredHeight = ComposerHeightCalculator.minimumHeight
+        let composer = NativeComposerTextView(
+            text: Binding(get: { draft }, set: { draft = $0 }),
+            height: Binding(get: { measuredHeight }, set: { measuredHeight = $0 }),
+            commands: [NativeCommand(name: "mcp", description: "Manage MCP servers")],
+            onSubmit: {}
+        )
+        let coordinator = composer.makeCoordinator()
+        let textView = ComposerTextView()
+        textView.string = draft
+        textView.commands = composer.commands
+        textView.delegate = coordinator
+        coordinator.textView = textView
+
+        #expect(coordinator.textView(
+            textView,
+            shouldChangeTextIn: NSRange(location: 1, length: 3),
+            replacementString: ""
+        ))
+        textView.string = "/"
+        textView.setSelectedRange(NSRange(location: 1, length: 0))
+        coordinator.textDidChange(Notification(
+            name: NSText.didChangeNotification,
+            object: textView
+        ))
+
+        #expect(draft == "/")
+        #expect(!coordinator.completionRequestPending)
+    }
+
     @Test func editor_tabs_and_terminal_panel_use_bounded_workbench_dimensions() {
         #expect(WorkbenchPresentationMetrics.editorTabHeight == 30)
         #expect(WorkbenchPresentationMetrics.editorTabMaximumWidth == 180)
@@ -2160,7 +2221,8 @@ struct TranscriptRenderingTests {
         #expect(recognizedText.contains("Native Conversation"))
         #expect(recognizedText.contains("Explain the native implementation"))
         #expect(recognizedText.contains("Result"))
-        #expect(recognizedText.contains("Run focused tests"))
+        #expect(recognizedText.contains("Tool Use"))
+        #expect(!recognizedText.contains("Run focused tests"))
         let markdownViews = descendants(
             of: NativeAgentMarkdownTextView.self,
             in: controller.view
@@ -2176,6 +2238,30 @@ struct TranscriptRenderingTests {
         if let path = ProcessInfo.processInfo.environment["KUBECODE_TRANSCRIPT_SNAPSHOT"] {
             try rendered.write(to: URL(fileURLWithPath: path), options: .atomic)
         }
+    }
+
+    @Test func consecutive_tool_uses_form_one_stable_stacked_group_per_run() {
+        let items = [
+            TranscriptItem(id: "thinking", role: .thinking, text: "Inspect", runID: "run-1"),
+            TranscriptItem(id: "tool-1", role: .tool, text: "Read A", runID: "run-1"),
+            TranscriptItem(id: "tool-2", role: .tool, text: "Read B", runID: "run-1"),
+            TranscriptItem(id: "answer", role: .agent, text: "Found it", runID: "run-1"),
+            TranscriptItem(id: "tool-3", role: .tool, text: "Test", runID: "run-1"),
+            TranscriptItem(id: "tool-4", role: .tool, text: "Other run", runID: "run-2"),
+        ]
+
+        let entries = TranscriptPresentationEntry.groupingTools(in: items)
+        #expect(entries.map(\.id) == ["thinking", "tool-1", "answer", "tool-3", "tool-4"])
+        guard case let .tools(_, firstTools) = entries[1],
+              case let .tools(_, secondTools) = entries[3],
+              case let .tools(_, thirdTools) = entries[4]
+        else {
+            Issue.record("Expected independent chronological tool groups")
+            return
+        }
+        #expect(firstTools.map(\.id) == ["tool-1", "tool-2"])
+        #expect(secondTools.map(\.id) == ["tool-3"])
+        #expect(thirdTools.map(\.id) == ["tool-4"])
     }
 
     @Test @MainActor func transcript_follows_streaming_output_without_overriding_user_scroll() async throws {
