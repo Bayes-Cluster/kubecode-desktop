@@ -29,7 +29,7 @@ extension View {
     @ViewBuilder
     func kubecodeControlGlass<S: Shape>(in shape: S) -> some View {
         if #available(macOS 26.0, *) {
-            self.glassEffect(.clear.interactive(), in: shape)
+            self.glassEffect(Glass.clear.interactive(), in: shape)
         } else {
             self.background(Color.primary.opacity(0.055), in: shape)
         }
