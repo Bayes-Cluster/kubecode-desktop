@@ -23,6 +23,19 @@ if [[ ! -d "${app_root}" ]]; then
 fi
 codesign --verify --deep --strict "${app_root}"
 
+if [[ "$(plutil -extract CFBundleIconFile raw -o - "${app_root}/Contents/Info.plist")" != "AppIcon" ]]; then
+  echo "Apple bundle does not declare the canonical AppIcon" >&2
+  exit 1
+fi
+if [[ ! -s "${resources_root}/AppIcon.icns" ]]; then
+  echo "Apple bundle is missing the multi-resolution AppIcon.icns" >&2
+  exit 1
+fi
+if [[ ! -s "${resources_root}/KubecodeMark.svg" ]]; then
+  echo "Apple bundle is missing the canonical Workspace Loop mark" >&2
+  exit 1
+fi
+
 for architecture in arm64 x86_64; do
   runtime_path="${runtime_root}/${architecture}/kubecode-server"
   node_path="${runtime_root}/${architecture}/node"

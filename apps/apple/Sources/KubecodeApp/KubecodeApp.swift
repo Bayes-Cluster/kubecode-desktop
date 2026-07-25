@@ -93,6 +93,7 @@ private struct WorkspaceWindow: View {
     var body: some View {
         ContentView(model: model)
             .frame(minWidth: 1040, minHeight: 680)
+            .tint(Color(red: 79 / 255, green: 99 / 255, blue: 245 / 255))
             .background(WorkspaceWindowCloseBridge(model: model).frame(width: 0, height: 0))
             .focusedSceneValue(\.workspaceModel, model)
             .preferredColorScheme(preferredColorScheme)

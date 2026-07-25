@@ -382,7 +382,6 @@
 "Final summary" = "Final summary";
 "HTTPS" = "HTTPS";
 "HTTPS endpoint" = "HTTPS endpoint";
-"Input" = "Input";
 "Kubecode creates the draft first, then loads the Leader's provider-native options." = "Kubecode creates the draft first, then loads the Leader's provider-native options.";
 "Leader Configuration" = "Leader Configuration";
 "Loading Leader configuration…" = "Loading Leader configuration…";
@@ -394,7 +393,6 @@
 "New File or Folder" = "New File or Folder";
 "Open Project…" = "Open Project…";
 "Open a local project to start an Agent session." = "Open a local project to start an Agent session.";
-"Output" = "Output";
 "Permission required by %@" = "Permission required by %@";
 "Projects" = "Projects";
 "Projects remain in their original folders. Removing one from Kubecode never deletes it." = "Projects remain in their original folders. Removing one from Kubecode never deletes it.";

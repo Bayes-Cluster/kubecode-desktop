@@ -1,6 +1,15 @@
 # Kubecode Clients
 
+<p align="center">
+  <img src="./apps/apple/Packaging/KubecodeMark.svg" width="96" height="96" alt="Kubecode Workspace Loop logo">
+</p>
+
 Native and desktop clients for the Kubecode Runtime.
+
+Brand assets follow the Workspace Loop / Modular Flow system documented in
+[`docs/BRAND_GUIDE.md`](docs/BRAND_GUIDE.md). macOS release bundles use the
+multi-resolution `apps/apple/Packaging/AppIcon.icns`; do not replace it with a
+single-resolution image.
 
 - `apps/apple`: native macOS client. iOS and iPadOS companion targets will share its client kit later.
 - `apps/tauri`: reserved for the future Windows and Linux client; no placeholder application is shipped yet.

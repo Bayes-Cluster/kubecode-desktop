@@ -382,7 +382,6 @@
 "Final summary" = "最终摘要";
 "HTTPS" = "HTTPS";
 "HTTPS endpoint" = "HTTPS 地址";
-"Input" = "输入";
 "Kubecode creates the draft first, then loads the Leader's provider-native options." = "Kubecode 会先创建草稿，再加载 Leader 的 provider 原生选项。";
 "Leader Configuration" = "Leader 配置";
 "Loading Leader configuration…" = "正在加载 Leader 配置…";
@@ -394,7 +393,6 @@
 "New File or Folder" = "新建文件或文件夹";
 "Open Project…" = "打开项目…";
 "Open a local project to start an Agent session." = "打开本地项目以启动 Agent 会话。";
-"Output" = "输出";
 "Permission required by %@" = "%@ 请求权限";
 "Projects" = "项目";
 "Projects remain in their original folders. Removing one from Kubecode never deletes it." = "项目会保留在原文件夹中。从 Kubecode 移除项目不会删除文件夹。";

@@ -37,6 +37,8 @@ mkdir -p \
   "${payload_cache}"
 cp "${apple_root}/Packaging/Info.plist" "${app_root}/Contents/Info.plist"
 cp "${swift_bin_path}/Kubecode" "${app_root}/Contents/MacOS/Kubecode"
+cp "${apple_root}/Packaging/AppIcon.icns" "${app_root}/Contents/Resources/AppIcon.icns"
+cp "${apple_root}/Packaging/KubecodeMark.svg" "${app_root}/Contents/Resources/KubecodeMark.svg"
 
 while IFS= read -r resource_bundle; do
   cp -R "${resource_bundle}" "${app_root}/Contents/Resources/"
