@@ -26,11 +26,53 @@ enum CodeSyntaxLanguage: Equatable {
         default: .plainText
         }
     }
+
+    static func detect(languageIdentifier: String?) -> Self {
+        guard let identifier = languageIdentifier?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+            !identifier.isEmpty
+        else { return .plainText }
+        return switch identifier {
+        case "swift": .swift
+        case "rust", "rs": .rust
+        case "javascript", "js", "jsx", "mjs", "cjs": .javascript
+        case "typescript", "ts", "tsx": .typescript
+        case "python", "py": .python
+        case "json", "jsonc": .json
+        case "markdown", "md", "mdx": .markdown
+        case "shell", "sh", "bash", "zsh", "fish", "console": .shell
+        case "yaml", "yml": .yaml
+        case "toml": .toml
+        case "css", "scss", "sass", "less": .css
+        case "html", "xml", "svg": .html
+        default: .plainText
+        }
+    }
 }
 
 enum CodeSyntaxHighlighter {
     static func attributedString(_ text: String, path: String, font: NSFont) -> NSAttributedString {
-        let language = CodeSyntaxLanguage.detect(path: path)
+        attributedString(text, language: .detect(path: path), font: font)
+    }
+
+    static func attributedString(
+        _ text: String,
+        languageIdentifier: String?,
+        font: NSFont
+    ) -> NSAttributedString {
+        attributedString(
+            text,
+            language: .detect(languageIdentifier: languageIdentifier),
+            font: font
+        )
+    }
+
+    private static func attributedString(
+        _ text: String,
+        language: CodeSyntaxLanguage,
+        font: NSFont
+    ) -> NSAttributedString {
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineHeightMultiple = 1.18
         let result = NSMutableAttributedString(

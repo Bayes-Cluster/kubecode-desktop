@@ -96,6 +96,15 @@ enum TerminalCreationContext {
     }
 }
 
+struct SessionSetupRequest: Identifiable, Equatable {
+    let id = UUID()
+    let agentID: AgentID
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.agentID == rhs.agentID
+    }
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -152,7 +161,7 @@ final class AppModel {
     var isLoadingProjectDirectory = false
     var isLoadingProviderSessions = false
     var isProjectBrowserPresented = false
-    var isSessionSetupPresented = false
+    var sessionSetupRequest: SessionSetupRequest?
     var isQuickOpenPresented = false
     var isSearchingQuickOpen = false
     var quickOpenResults: [FileEntry] = []
@@ -162,6 +171,7 @@ final class AppModel {
     private var server: ServerSession?
     private var eventsTask: Task<Void, Never>?
     private var runEventsTask: Task<Void, Never>?
+    private var runEventBridge: AgentEventDispatchBridge?
     private var directlyStreamedRunID: String?
     private var processedRunSequence = 0
     private var runStreamGeneration = 0
@@ -225,6 +235,14 @@ final class AppModel {
         set { projections.terminals = newValue }
     }
     var selectedProject: Project? { projects.first { $0.id == selectedProjectID } }
+    var markdownProjectResourceContext: MarkdownProjectResourceContext? {
+        guard let selectedProjectID, let server else { return nil }
+        return MarkdownProjectResourceContext(
+            identity: "\(server.id.uuidString):\(selectedProjectID)",
+            projectID: selectedProjectID,
+            client: server.client
+        )
+    }
     var selectedConversation: Conversation? {
         conversations.first { $0.id == selectedConversationID }
     }
@@ -919,6 +937,20 @@ final class AppModel {
               let agent = availableAgents.first
         else { return }
         createSession(agent: agent.id, projectID: project.id)
+    }
+
+    func presentSessionSetup(preferredAgent: AgentID? = nil) {
+        guard selectedProject != nil else { return }
+        let available = availableAgents.map(\.id)
+        guard let agentID = if let preferredAgent, available.contains(preferredAgent) {
+            preferredAgent
+        } else if let selectedAgent = selectedConversation?.agentID,
+                  available.contains(selectedAgent) {
+            selectedAgent
+        } else {
+            available.first
+        } else { return }
+        sessionSetupRequest = SessionSetupRequest(agentID: agentID)
     }
 
     func createSession(
@@ -2316,6 +2348,11 @@ final class AppModel {
     }
 
     func handleWorkspaceEvent(_ event: WorkspaceEvent) async {
+        if event.runID == directlyStreamedRunID,
+           ["text_delta", "thinking_delta", "tool_started", "tool_updated", "tool_completed"]
+            .contains(event.kind) {
+            return
+        }
         if let notificationCoordinator, let server {
             let catalog = navigationCatalogs.first { $0.project.id == event.projectID }
             let conversation = catalog?.conversations.first { $0.id == event.conversationID }
@@ -2468,6 +2505,14 @@ final class AppModel {
         if directlyStreamedRunID == runID, runEventsTask != nil { return }
         stopRunEventStream()
         let generation = runStreamGeneration
+        let bridge = AgentEventDispatchBridge { [weak self] events in
+            guard let self, self.runStreamGeneration == generation else { return }
+            TranscriptReducer.applyStreamingEvents(events, to: &self.transcript)
+            for event in events {
+                AgentInteractionReducer.apply(event, to: &self.interaction)
+            }
+        }
+        runEventBridge = bridge
         directlyStreamedRunID = runID
         processedRunSequence = sequence
         runEventsTask = Task { [weak self] in
@@ -2476,6 +2521,7 @@ final class AppModel {
             defer {
                 if self.runStreamGeneration == generation {
                     self.runEventsTask = nil
+                    self.runEventBridge = nil
                     self.directlyStreamedRunID = nil
                     self.processedRunSequence = 0
                     self.isRunStreamReconnecting = false
@@ -2491,9 +2537,7 @@ final class AppModel {
                         self.processedRunSequence = policy.lastSequence
                         self.isRunStreamReconnecting = false
                         guard self.selectedConversationID != nil else { continue }
-                        TranscriptReducer.applyStreamingEvent(event, to: &self.transcript)
-                        AgentInteractionReducer.apply(event, to: &self.interaction)
-                        await Task.yield()
+                        await bridge.enqueue(event)
                         if event.kind == "run_completed" {
                             if let conversationID = self.selectedConversationID {
                                 await self.refreshConversation(conversationID)
@@ -2511,6 +2555,7 @@ final class AppModel {
                     self.isRunStreamReconnecting = true
                     try? await Task.sleep(for: .milliseconds(delayMilliseconds))
                 case .stop:
+                    await bridge.flushNow()
                     if let conversationID = self.selectedConversationID {
                         await self.refreshConversation(conversationID)
                     }
@@ -2527,6 +2572,10 @@ final class AppModel {
         runStreamGeneration &+= 1
         runEventsTask?.cancel()
         runEventsTask = nil
+        if let runEventBridge {
+            Task { await runEventBridge.stop(discardPending: true) }
+        }
+        runEventBridge = nil
         directlyStreamedRunID = nil
         processedRunSequence = 0
         isRunStreamReconnecting = false

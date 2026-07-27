@@ -8,6 +8,7 @@ import Vision
 @testable import KubecodeApp
 import KubecodeKit
 import KubecodeMacRuntime
+import KubecodeMacUI
 import KubecodeUI
 
 @MainActor
@@ -23,6 +24,127 @@ private final class ApplicationConnectionOwnershipSpy: ApplicationConnectionOwne
 @Suite(.serialized)
 @MainActor
 struct TranscriptRenderingTests {
+    @Test func transcript_tail_geometry_includes_the_composer_obstruction() {
+        let geometry = TranscriptScrollGeometry(
+            documentHeight: 1_200,
+            viewportHeight: 600,
+            bottomObstructionHeight: 96
+        )
+
+        #expect(geometry.maximumOriginY == 696)
+        #expect(geometry.distanceFromTail(originY: 696) == 0)
+        #expect(geometry.distanceFromTail(originY: 624) == 72)
+        #expect(geometry.clampedOriginY(900) == 696)
+    }
+
+    @Test func native_transcript_height_cache_is_content_aware_and_bounded() {
+        var cache = TranscriptHeightCache(capacity: 3)
+        cache.insert(42, for: .init(id: "one", contentRevision: 1, layoutRevision: 0, width: 600))
+        cache.insert(52, for: .init(id: "two", contentRevision: 1, layoutRevision: 0, width: 600))
+        cache.insert(62, for: .init(id: "three", contentRevision: 1, layoutRevision: 0, width: 600))
+
+        #expect(cache.height(for: .init(
+            id: "one",
+            contentRevision: 1,
+            layoutRevision: 0,
+            width: 600
+        )) == 42)
+        #expect(cache.height(for: .init(
+            id: "one",
+            contentRevision: 2,
+            layoutRevision: 0,
+            width: 600
+        )) == nil)
+        #expect(cache.height(for: .init(
+            id: "one",
+            contentRevision: 1,
+            layoutRevision: 1,
+            width: 600
+        )) == nil)
+
+        cache.insert(72, for: .init(id: "four", contentRevision: 1, layoutRevision: 0, width: 600))
+        #expect(cache.count == 3)
+        #expect(cache.height(for: .init(
+            id: "two",
+            contentRevision: 1,
+            layoutRevision: 0,
+            width: 600
+        )) == nil)
+    }
+
+    @Test func native_transcript_update_plan_targets_presentation_changes() {
+        let original = [
+            NativeTranscriptItem(id: "one", contentRevision: 1, layoutRevision: 0),
+            NativeTranscriptItem(id: "two", contentRevision: 1, layoutRevision: 0),
+        ]
+        let expanded = [
+            original[0],
+            NativeTranscriptItem(id: "two", contentRevision: 1, layoutRevision: 1),
+        ]
+
+        let targeted = TranscriptCollectionUpdatePlan.between(
+            previous: original,
+            current: expanded
+        )
+        #expect(!targeted.reloadsAllItems)
+        #expect(targeted.changedIndexes == IndexSet(integer: 1))
+        #expect(targeted.insertedIndexes.isEmpty)
+        #expect(targeted.deletedIndexes.isEmpty)
+
+        let reordered = TranscriptCollectionUpdatePlan.between(
+            previous: original,
+            current: Array(expanded.reversed())
+        )
+        #expect(reordered.reloadsAllItems)
+        #expect(reordered.changedIndexes.isEmpty)
+
+        let insertedItems = [
+            original[0],
+            NativeTranscriptItem(id: "update", contentRevision: 1),
+            original[1],
+        ]
+        let inserted = TranscriptCollectionUpdatePlan.between(
+            previous: original,
+            current: insertedItems
+        )
+        #expect(!inserted.reloadsAllItems)
+        #expect(inserted.insertedIndexes == IndexSet(integer: 1))
+        #expect(inserted.deletedIndexes.isEmpty)
+
+        let deleted = TranscriptCollectionUpdatePlan.between(
+            previous: insertedItems,
+            current: original
+        )
+        #expect(!deleted.reloadsAllItems)
+        #expect(deleted.insertedIndexes.isEmpty)
+        #expect(deleted.deletedIndexes == IndexSet(integer: 1))
+
+        let completingRun = TranscriptCollectionUpdatePlan.between(
+            previous: [
+                NativeTranscriptItem(id: "activity", contentRevision: 1),
+                NativeTranscriptItem(id: "output", contentRevision: 1),
+            ],
+            current: [
+                NativeTranscriptItem(id: "output", contentRevision: 2),
+            ]
+        )
+        #expect(completingRun.reloadsAllItems)
+    }
+
+    @Test func native_transcript_layout_gate_coalesces_work_per_display_frame() {
+        var gate = TranscriptLayoutGate(maximumCommitsPerSecond: 120)
+
+        let first = gate.requestCommit(frame: 10, semanticRevision: 1, timestamp: 0)
+        let duplicateFrame = gate.requestCommit(frame: 10, semanticRevision: 2, timestamp: 0.001)
+        let nextFrame = gate.requestCommit(frame: 11, semanticRevision: 2, timestamp: 0.016)
+        let duplicateNextFrame = gate.requestCommit(frame: 11, semanticRevision: 2, timestamp: 0.017)
+
+        #expect(first)
+        #expect(!duplicateFrame)
+        #expect(nextFrame)
+        #expect(!duplicateNextFrame)
+    }
+
     @Test func inspector_defaults_to_a_compact_workbench_column() {
         #expect(WorkbenchPresentationMetrics.inspectorMinimumWidth == 220)
         #expect(WorkbenchPresentationMetrics.inspectorIdealWidth == 260)
@@ -189,6 +311,72 @@ struct TranscriptRenderingTests {
         #expect(second.selectedConversationID == nil)
     }
 
+    @Test @MainActor func window_workspace_owns_independent_session_presentation_state() {
+        let connections = MacConnectionManager()
+        let first = WindowWorkspaceModel(connections: connections)
+        let second = WindowWorkspaceModel(connections: connections)
+
+        first.session.composerHeight = 180
+        first.session.transcriptScrollController.viewportDidChange(isNearBottom: false)
+        first.session.setTranscriptExpanded(true, sessionID: "session-a", itemID: "tool-a")
+
+        #expect(first.workspace.connections === second.workspace.connections)
+        #expect(first.workspace !== second.workspace)
+        #expect(first.session !== second.session)
+        #expect(first.session.composerHeight == 180)
+        #expect(second.session.composerHeight == ComposerHeightCalculator.minimumHeight)
+        #expect(!first.session.transcriptScrollController.followsOutput)
+        #expect(second.session.transcriptScrollController.followsOutput)
+        #expect(first.session.isTranscriptExpanded(sessionID: "session-a", itemID: "tool-a"))
+        #expect(!second.session.isTranscriptExpanded(sessionID: "session-a", itemID: "tool-a"))
+        #expect(!first.session.isTranscriptExpanded(sessionID: "session-b", itemID: "tool-a"))
+    }
+
+    @Test @MainActor func nested_disclosure_invalidates_its_outer_activity_once() {
+        let session = SessionWorkspaceModel()
+        let initial = session.transcriptLayoutRevision(
+            sessionID: "session-a",
+            ownerID: "activity-a"
+        )
+
+        session.setTranscriptExpanded(
+            true,
+            sessionID: "session-a",
+            itemID: "tool-a",
+            ownerID: "activity-a"
+        )
+        let expanded = session.transcriptLayoutRevision(
+            sessionID: "session-a",
+            ownerID: "activity-a"
+        )
+        #expect(expanded == initial + 1)
+
+        session.setTranscriptExpanded(
+            true,
+            sessionID: "session-a",
+            itemID: "tool-a",
+            ownerID: "activity-a"
+        )
+        #expect(session.transcriptLayoutRevision(
+            sessionID: "session-a",
+            ownerID: "activity-a"
+        ) == expanded)
+
+        session.setShowsAllTranscriptSteps(
+            true,
+            sessionID: "session-a",
+            ownerID: "activity-a"
+        )
+        #expect(session.showsAllTranscriptSteps(
+            sessionID: "session-a",
+            ownerID: "activity-a"
+        ))
+        #expect(session.transcriptLayoutRevision(
+            sessionID: "session-a",
+            ownerID: "activity-a"
+        ) == expanded + 1)
+    }
+
     @Test @MainActor func team_member_navigation_forces_a_read_only_transcript() throws {
         let connections = MacConnectionManager()
         let model = AppModel(connections: connections)
@@ -340,7 +528,7 @@ struct TranscriptRenderingTests {
         }
     }
 
-    @Test @MainActor func agent_markdown_selection_crosses_rendered_lines_and_blocks() throws {
+    @Test @MainActor func agent_markdown_selection_crosses_rendered_lines_and_blocks() async throws {
         let controller = NSHostingController(rootView: AgentMarkdownView(source: """
         Selection alpha begins in the first rendered paragraph.
 
@@ -359,11 +547,15 @@ struct TranscriptRenderingTests {
         defer { window.orderOut(nil) }
         window.layoutIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.15))
+        try await Task.sleep(for: .milliseconds(150))
         let textView = try #require(firstSubview(
             of: NativeAgentMarkdownTextView.self,
             in: controller.view
         ))
+        let renderDeadline = Date().addingTimeInterval(1)
+        while textView.string.contains("\n\n"), Date() < renderDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let range = try #require(textView.string.range(
             of: "alpha begins in the first rendered paragraph.\nSelection omega"
         ))
@@ -373,7 +565,7 @@ struct TranscriptRenderingTests {
         textView.setSelectedRange(selection)
         window.makeFirstResponder(textView)
         textView.copy(nil)
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        try await Task.sleep(for: .milliseconds(50))
 
         let selected = NSPasteboard.general.string(forType: .string) ?? ""
         #expect(selected.contains("alpha"))
@@ -408,6 +600,28 @@ struct TranscriptRenderingTests {
         #expect(coordinator.renderCount == 2)
     }
 
+    @Test @MainActor func recycled_markdown_rows_do_not_retain_shared_render_documents() {
+        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
+        let source = "Unique recycled response \(UUID().uuidString) **Markdown**"
+        let firstCoordinator = NativeSelectableAgentMarkdownView.Coordinator()
+        let secondCoordinator = NativeSelectableAgentMarkdownView.Coordinator()
+
+        let first = firstCoordinator.rendered(
+            source: source,
+            typography: typography,
+            tone: .primary
+        )
+        let recycled = secondCoordinator.rendered(
+            source: source,
+            typography: typography,
+            tone: .primary
+        )
+
+        #expect(first !== recycled)
+        #expect(firstCoordinator.renderCount == 1)
+        #expect(secondCoordinator.renderCount == 1)
+    }
+
     @Test @MainActor func viewport_updates_do_not_replace_unchanged_native_text_storage() throws {
         let coordinator = NativeSelectableAgentMarkdownView.Coordinator()
         let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
@@ -438,6 +652,108 @@ struct TranscriptRenderingTests {
         #expect(coordinator.applyCount == 2)
     }
 
+    @Test @MainActor func streaming_markdown_stays_plain_and_does_not_schedule_rich_rendering() async {
+        let coordinator = NativeSelectableAgentMarkdownView.Coordinator()
+        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
+        let textView = NativeAgentMarkdownTextView(frame: .zero)
+
+        coordinator.apply(
+            source: "First",
+            typography: typography,
+            tone: .primary,
+            isStreaming: true,
+            to: textView
+        )
+        coordinator.apply(
+            source: "First second",
+            typography: typography,
+            tone: .primary,
+            isStreaming: true,
+            to: textView
+        )
+
+        #expect(textView.string == "First second")
+        #expect(coordinator.applyCount == 0)
+        try? await Task.sleep(for: .milliseconds(120))
+        #expect(coordinator.applyCount == 0)
+        #expect(coordinator.renderCount == 0)
+        #expect(textView.string == "First second")
+    }
+
+    @Test @MainActor func native_markdown_height_cache_requires_the_exact_layout_width() {
+        let coordinator = NativeSelectableAgentMarkdownView.Coordinator()
+        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
+
+        _ = coordinator.rendered(
+            source: "Initial output",
+            typography: typography,
+            tone: .primary
+        )
+
+        coordinator.cacheHeight(84, for: 719.2)
+
+        #expect(coordinator.cachedHeight(for: 719.2) == 84)
+        #expect(coordinator.cachedHeight(for: 719.4) == nil)
+
+        _ = coordinator.rendered(
+            source: "Initial output with another streamed line",
+            typography: typography,
+            tone: .primary
+        )
+        #expect(coordinator.cachedHeight(for: 719.2) == nil)
+    }
+
+    @Test @MainActor func native_markdown_measurement_is_width_sensitive_and_detached() {
+        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
+        let rendered = NativeAgentMarkdownRenderer.render(
+            AgentMarkdownDocument(source: String(
+                repeating: "A long response must wrap at the proposed width. ",
+                count: 20
+            )),
+            typography: typography,
+            tone: .primary
+        )
+
+        let narrow = NativeAgentMarkdownMeasurement.height(
+            for: rendered,
+            width: 320,
+            minimumHeight: typography.pointSize + 2,
+            verticalInset: 4
+        )
+        let wide = NativeAgentMarkdownMeasurement.height(
+            for: rendered,
+            width: 760,
+            minimumHeight: typography.pointSize + 2,
+            verticalInset: 4
+        )
+
+        #expect(narrow > wide)
+        #expect(wide > typography.pointSize)
+    }
+
+    @Test @MainActor func native_markdown_container_tracks_its_final_view_frame() throws {
+        let controller = NSHostingController(rootView: AgentMarkdownView(
+            source: String(repeating: "A long response must wrap at the proposed width. ", count: 20)
+        ).frame(width: 320, alignment: .topLeading))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 500),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.layoutIfNeeded()
+        controller.view.layoutSubtreeIfNeeded()
+
+        let textView = try #require(firstSubview(
+            of: NativeAgentMarkdownTextView.self,
+            in: controller.view
+        ))
+        #expect(textView.textContainer?.widthTracksTextView == true)
+        #expect(abs((textView.textContainer?.containerSize.width ?? 0) - textView.bounds.width) < 1)
+        #expect(textView.frame.height > 100)
+    }
+
     @Test @MainActor func native_code_blocks_start_at_the_message_leading_edge() throws {
         let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
         let rendered = NativeAgentMarkdownRenderer.render(
@@ -459,6 +775,52 @@ struct TranscriptRenderingTests {
         ) as? NSParagraphStyle)
         #expect(style.firstLineHeadIndent == 0)
         #expect(style.headIndent == 0)
+    }
+
+    @Test @MainActor func native_gfm_task_lists_keep_their_read_only_state() {
+        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
+        let rendered = NativeAgentMarkdownRenderer.render(
+            AgentMarkdownDocument(source: "- [x] shipped\n- [ ] follow up"),
+            typography: typography,
+            tone: .primary
+        )
+
+        #expect(rendered.string.contains("☑ shipped"))
+        #expect(rendered.string.contains("☐ follow up"))
+    }
+
+    @Test @MainActor func native_gfm_tables_use_textkit_cells_and_column_alignment() throws {
+        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
+        let rendered = NativeAgentMarkdownRenderer.render(
+            AgentMarkdownDocument(source: """
+            | Name | Score |
+            | :--- | ---: |
+            | Ada | 42 |
+            """),
+            typography: typography,
+            tone: .primary
+        )
+        let scoreRange = try #require(rendered.string.range(of: "42"))
+        let scoreStyle = try #require(rendered.attribute(
+            .paragraphStyle,
+            at: NSRange(scoreRange, in: rendered.string).location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle)
+
+        #expect(!scoreStyle.textBlocks.isEmpty)
+        #expect(scoreStyle.alignment == .right)
+    }
+
+    @Test @MainActor func unloaded_markdown_images_keep_selectable_alt_text() {
+        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
+        let rendered = NativeAgentMarkdownRenderer.render(
+            AgentMarkdownDocument(source: "![Architecture](https://example.com/diagram.png)"),
+            typography: typography,
+            tone: .primary
+        )
+
+        #expect(rendered.string.contains("Architecture"))
+        #expect(rendered.containsAttachments(in: NSRange(location: 0, length: rendered.length)))
     }
 
     @Test @MainActor func inline_math_attachments_use_the_formula_baseline() throws {
@@ -762,6 +1124,38 @@ struct TranscriptRenderingTests {
         await Task.yield()
         try? await Task.sleep(for: .milliseconds(100))
         #expect(measuredHeight == ComposerHeightCalculator.maximumHeight)
+    }
+
+    @Test @MainActor func native_composer_coalesces_repeated_layout_measurements() async throws {
+        var measuredHeight = ComposerHeightCalculator.minimumHeight
+        let scrollView = ComposerScrollView()
+        let textView = ComposerTextView()
+        textView.font = .preferredFont(forTextStyle: .body)
+        textView.textContainer?.widthTracksTextView = true
+        textView.string = String(repeating: "A wrapped composer line. ", count: 20)
+        scrollView.documentView = textView
+        scrollView.heightBinding = Binding(
+            get: { measuredHeight },
+            set: { measuredHeight = $0 }
+        )
+        scrollView.setFrameSize(NSSize(width: 320, height: 72))
+
+        for _ in 0..<100 {
+            scrollView.scheduleMeasurement()
+        }
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(scrollView.completedMeasurementCount == 1)
+        #expect(measuredHeight > ComposerHeightCalculator.minimumHeight)
+
+        measuredHeight = ComposerHeightCalculator.minimumHeight
+        scrollView.scheduleMeasurement()
+        await Task.yield()
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(scrollView.completedMeasurementCount == 1)
+        #expect(measuredHeight > ComposerHeightCalculator.minimumHeight)
     }
 
     @Test @MainActor func native_composer_disables_smart_replacements_for_code_and_paths() throws {
@@ -1650,12 +2044,40 @@ struct TranscriptRenderingTests {
         let png = try #require(bitmap.representation(using: .png, properties: [:]))
         let recognizedText = try recognizeText(in: try #require(bitmap.cgImage))
 
+        let navigatorFrames = try [
+            "navigator.sessions-area.layout",
+            "navigator.plan-header.layout",
+            "navigator.changes-header.layout",
+            "navigator.files-header.layout",
+            "navigator.runtime-footer.layout",
+        ].map { identifier in
+            let view = try #require(descendant(
+                accessibilityIdentifier: identifier,
+                in: controller.view
+            ))
+            return controller.view.convert(view.bounds, from: view)
+        }
+        let centers = navigatorFrames.map(\.midY)
+        if controller.view.isFlipped {
+            #expect(zip(centers, centers.dropFirst()).allSatisfy { $0.0 < $0.1 })
+            #expect(zip(navigatorFrames, navigatorFrames.dropFirst()).allSatisfy {
+                $0.0.maxY <= $0.1.minY + 1
+            })
+        } else {
+            #expect(zip(centers, centers.dropFirst()).allSatisfy { $0.0 > $0.1 })
+            #expect(zip(navigatorFrames, navigatorFrames.dropFirst()).allSatisfy {
+                $0.0.minY >= $0.1.maxY - 1
+            })
+        }
+        #expect(descendants(of: NSSplitView.self, in: controller.view).count == 1)
+        let nativeSidebarText = descendants(of: NSTextField.self, in: controller.view)
+            .filter { controller.view.convert($0.bounds, from: $0).maxX <= 320 }
+            .map(\.stringValue)
+        #expect(nativeSidebarText.contains("Inspect the Project"))
+        #expect(nativeSidebarText.contains("Implement the native Explorer"))
+
         #expect(png.count > 20_000)
-        #expect(recognizedText.contains("Changes"))
-        #expect(recognizedText.contains("Agent Plan"))
-        #expect(recognizedText.contains("Files"))
         #expect(recognizedText.contains("27%"))
-        #expect(recognizedText.contains("Completed"))
         if ProcessInfo.processInfo.environment["KUBECODE_COMPOSER_SNAPSHOT_TEXT"] == nil {
             #expect(recognizedText.contains("Claude Code"))
             #expect(recognizedText.contains("Sonnet"))
@@ -2221,7 +2643,9 @@ struct TranscriptRenderingTests {
         #expect(recognizedText.contains("Native Conversation"))
         #expect(recognizedText.contains("Explain the native implementation"))
         #expect(recognizedText.contains("Result"))
-        #expect(recognizedText.contains("Tool Use"))
+        #expect(recognizedText.contains("Worked"))
+        #expect(recognizedText.contains("2 steps"))
+        #expect(recognizedText.contains("1 tool"))
         #expect(!recognizedText.contains("Run focused tests"))
         let markdownViews = descendants(
             of: NativeAgentMarkdownTextView.self,
@@ -2240,28 +2664,140 @@ struct TranscriptRenderingTests {
         }
     }
 
-    @Test func consecutive_tool_uses_form_one_stable_stacked_group_per_run() {
+    @Test func repeated_agent_work_forms_one_stable_activity_per_run() {
         let items = [
             TranscriptItem(id: "thinking", role: .thinking, text: "Inspect", runID: "run-1"),
             TranscriptItem(id: "tool-1", role: .tool, text: "Read A", runID: "run-1"),
             TranscriptItem(id: "tool-2", role: .tool, text: "Read B", runID: "run-1"),
             TranscriptItem(id: "answer", role: .agent, text: "Found it", runID: "run-1"),
             TranscriptItem(id: "tool-3", role: .tool, text: "Test", runID: "run-1"),
-            TranscriptItem(id: "tool-4", role: .tool, text: "Other run", runID: "run-2"),
+            TranscriptItem(id: "status", role: .status, text: "completed", runID: "run-1", status: "completed"),
         ]
 
-        let entries = TranscriptPresentationEntry.groupingTools(in: items)
-        #expect(entries.map(\.id) == ["thinking", "tool-1", "answer", "tool-3", "tool-4"])
-        guard case let .tools(_, firstTools) = entries[1],
-              case let .tools(_, secondTools) = entries[3],
-              case let .tools(_, thirdTools) = entries[4]
+        let entries = TranscriptPresentation.entries(items: items, activeRunID: nil)
+        #expect(entries.map(\.id) == ["run-run-1-presentation"])
+        guard case let .run(presentation) = entries[0],
+              let activity = presentation.activity,
+              let output = presentation.output
         else {
-            Issue.record("Expected independent chronological tool groups")
+            Issue.record("Expected one chronological run presentation")
             return
         }
-        #expect(firstTools.map(\.id) == ["tool-1", "tool-2"])
-        #expect(secondTools.map(\.id) == ["tool-3"])
-        #expect(thirdTools.map(\.id) == ["tool-4"])
+        #expect(activity.items.map(\.id) == ["thinking", "tool-1", "tool-2", "tool-3"])
+        #expect(activity.toolCount == 3)
+        #expect(output.phase == .final)
+        #expect(output.text == "Found it")
+    }
+
+    @Test func activity_disclosure_follows_run_defaults_until_the_user_overrides_it() {
+        var state = TranscriptActivityDisclosureState()
+
+        #expect(state.resolved(defaultExpanded: true))
+        #expect(!state.resolved(defaultExpanded: false))
+
+        state.userSet(false)
+        #expect(!state.resolved(defaultExpanded: true))
+
+        state.userSet(true)
+        #expect(state.resolved(defaultExpanded: false))
+    }
+
+    @Test @MainActor func activity_disclosure_remeasures_without_output_or_scroll() async throws {
+        let model = AppModel(connections: MacConnectionManager())
+        let session = SessionWorkspaceModel()
+        let project = try decode(Project.self, from: """
+        {"id":"project-1","name":"Kubecode","workspaces_enabled":false}
+        """)
+        let conversation = try decode(Conversation.self, from: """
+        {
+          "id":"session-1","project_id":"project-1","agent_id":"codex",
+          "title":"Disclosure Layout","execution_mode":"default","latest_run_status":"running"
+        }
+        """)
+        model.projects = [project]
+        model.selectedProjectID = project.id
+        model.conversations = [conversation]
+        model.selectedConversationID = conversation.id
+        model.runs = [try decode(AgentRun.self, from: """
+        {
+          "id":"run-1","conversation_id":"session-1","project_id":"project-1",
+          "message":"Inspect","status":"running","error":null,
+          "permission_mode":null,"internal":false
+        }
+        """)]
+        model.transcript = [
+            TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+        ] + (0..<40).map { index in
+            TranscriptItem(
+                id: "tool-\(index)",
+                role: .tool,
+                text: "Tool \(index)",
+                runID: "run-1",
+                detail: String(repeating: "Detailed output line \(index)\n", count: 6),
+                status: "completed"
+            )
+        }
+        session.setTranscriptExpanded(
+            false,
+            sessionID: conversation.id,
+            itemID: "run-run-1-activity",
+            ownerID: "run-run-1-activity"
+        )
+
+        let controller = NSHostingController(rootView: ContentView(
+            model: model,
+            sessionWorkspace: session
+        ).frame(width: 940, height: 680))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 940, height: 680),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+
+        await settle(window: window, controller: controller)
+        var collectionView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        let collapsedHeight = collectionView.bounds.height
+        let collapsedItemCount = collectionView.numberOfItems(inSection: 0)
+
+        session.setTranscriptExpanded(
+            true,
+            sessionID: conversation.id,
+            itemID: "run-run-1-activity",
+            ownerID: "run-run-1-activity"
+        )
+        session.setShowsAllTranscriptSteps(
+            true,
+            sessionID: conversation.id,
+            ownerID: "run-run-1-activity"
+        )
+        await settle(window: window, controller: controller)
+        collectionView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        let expandedHeight = collectionView.bounds.height
+        #expect(expandedHeight > collapsedHeight + 100)
+        #expect(collectionView.numberOfItems(inSection: 0) > collapsedItemCount + 30)
+
+        session.setTranscriptExpanded(
+            false,
+            sessionID: conversation.id,
+            itemID: "run-run-1-activity",
+            ownerID: "run-run-1-activity"
+        )
+        await settle(window: window, controller: controller)
+        collectionView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        #expect(abs(collectionView.bounds.height - collapsedHeight) < 2)
     }
 
     @Test @MainActor func transcript_follows_streaming_output_without_overriding_user_scroll() async throws {
@@ -2279,7 +2815,19 @@ struct TranscriptRenderingTests {
         model.selectedProjectID = project.id
         model.conversations = [conversation]
         model.selectedConversationID = conversation.id
+        model.runs = [try decode(AgentRun.self, from: """
+        {
+          "id":"run-1","conversation_id":"session-1","project_id":"project-1",
+          "message":"Explain the implementation","status":"running",
+          "error":null,"permission_mode":null,"internal":false
+        }
+        """)]
         model.transcript = [
+            TranscriptItem(
+                id: "historic-answer",
+                role: .agent,
+                text: String(repeating: "Historic completed output line.\n", count: 160)
+            ),
             TranscriptItem(
                 id: "run-1-user",
                 role: .user,
@@ -2294,6 +2842,7 @@ struct TranscriptRenderingTests {
                 runID: "run-1"
             ),
         ]
+        let activeAnswerIndex = 2
 
         let controller = NSHostingController(rootView: ContentView(model: model)
             .frame(width: 980, height: 680))
@@ -2308,14 +2857,60 @@ struct TranscriptRenderingTests {
         defer { window.orderOut(nil) }
 
         await settle(window: window, controller: controller)
-        let observer = try #require(descendant(
-            of: NativeTranscriptScrollObserver.ObserverView.self,
+        var collectionView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
             in: controller.view
         ))
-        let scrollView = try #require(observer.enclosingScrollView)
+        var scrollView = try #require(collectionView.enclosingScrollView)
         #expect(distanceFromBottom(of: scrollView) <= 80)
 
-        model.transcript[1] = TranscriptItem(
+        // Collapsing and expanding the navigator repeatedly changes the
+        // transcript proposal width. These resize passes must not feed back
+        // into TextKit measurement or leave recycled rows overlapping.
+        for (index, width) in [760.0, 980.0, 820.0, 980.0].enumerated() {
+            NotificationCenter.default.post(
+                name: NSScrollView.willStartLiveScrollNotification,
+                object: scrollView
+            )
+            window.setContentSize(NSSize(width: width, height: 680))
+            scrollUp(scrollView, distance: 24)
+            model.transcript[activeAnswerIndex] = TranscriptItem(
+                id: "run-1-answer",
+                role: .agent,
+                text: String(
+                    repeating: "Concurrent streamed output line.\n",
+                    count: 82 + index * 4
+                ),
+                eventKind: "text_delta",
+                runID: "run-1"
+            )
+            scrollToBottom(scrollView)
+            NotificationCenter.default.post(
+                name: NSScrollView.didEndLiveScrollNotification,
+                object: scrollView
+            )
+            await settle(window: window, controller: controller)
+        }
+        collectionView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        scrollView = try #require(collectionView.enclosingScrollView)
+        let markdownFrames = descendants(
+            of: NativeAgentMarkdownTextView.self,
+            in: controller.view
+        )
+            .map { $0.convert($0.bounds, to: controller.view) }
+            .sorted { $0.minY < $1.minY }
+        #expect(!markdownFrames.isEmpty)
+        #expect(markdownFrames.allSatisfy {
+            $0.height > 20 && $0.height.isFinite && $0.width.isFinite
+        })
+        for pair in zip(markdownFrames, markdownFrames.dropFirst()) {
+            #expect(pair.0.maxY <= pair.1.minY + 1)
+        }
+
+        model.transcript[activeAnswerIndex] = TranscriptItem(
             id: "run-1-answer",
             role: .agent,
             text: String(repeating: "Growing streamed output line.\n", count: 130),
@@ -2323,15 +2918,34 @@ struct TranscriptRenderingTests {
             runID: "run-1"
         )
         await settle(window: window, controller: controller)
+        collectionView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        scrollView = try #require(collectionView.enclosingScrollView)
         #expect(distanceFromBottom(of: scrollView) <= 80)
+        let documentHeight = try #require(scrollView.documentView?.bounds.height)
+        #expect(documentHeight > scrollView.documentVisibleRect.height + 200)
+        let streamedMarkdownHeight = descendants(
+            of: NativeAgentMarkdownTextView.self,
+            in: controller.view
+        ).map(\.frame.height).max() ?? 0
+        #expect(streamedMarkdownHeight > 400)
 
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
         scrollUp(scrollView, distance: 240)
-        observer.coordinator?.reportUserNavigation()
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
         try? await Task.sleep(for: .milliseconds(80))
         let userPosition = scrollView.documentVisibleRect.origin.y
         #expect(distanceFromBottom(of: scrollView) > 150)
 
-        model.transcript[1] = TranscriptItem(
+        model.transcript[activeAnswerIndex] = TranscriptItem(
             id: "run-1-answer",
             role: .agent,
             text: String(repeating: "Growing streamed output line.\n", count: 180),
@@ -2339,13 +2953,25 @@ struct TranscriptRenderingTests {
             runID: "run-1"
         )
         await settle(window: window, controller: controller)
+        collectionView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        scrollView = try #require(collectionView.enclosingScrollView)
         #expect(abs(scrollView.documentVisibleRect.origin.y - userPosition) < 4)
         #expect(distanceFromBottom(of: scrollView) > 150)
 
+        NotificationCenter.default.post(
+            name: NSScrollView.willStartLiveScrollNotification,
+            object: scrollView
+        )
         scrollToBottom(scrollView)
-        observer.coordinator?.reportUserNavigation()
+        NotificationCenter.default.post(
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
         try? await Task.sleep(for: .milliseconds(80))
-        model.transcript[1] = TranscriptItem(
+        model.transcript[activeAnswerIndex] = TranscriptItem(
             id: "run-1-answer",
             role: .agent,
             text: String(repeating: "Growing streamed output line.\n", count: 220),
@@ -2353,6 +2979,62 @@ struct TranscriptRenderingTests {
             runID: "run-1"
         )
         await settle(window: window, controller: controller)
+        scrollView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        )?.enclosingScrollView)
+        #expect(distanceFromBottom(of: scrollView) <= 48)
+
+        model.runs = [try decode(AgentRun.self, from: """
+        {
+          "id":"run-1","conversation_id":"session-1","project_id":"project-1",
+          "message":"Explain the implementation","status":"completed",
+          "error":null,"permission_mode":null,"internal":false
+        }
+        """)]
+        model.transcript[activeAnswerIndex] = TranscriptItem(
+            id: "run-1-answer",
+            role: .agent,
+            text: """
+            ## Final result
+
+            | Stage | Result |
+            | --- | --- |
+            | Streaming | Complete |
+            | Layout | Stable |
+
+            ```swift
+            let answer = 42
+            ```
+
+            \\[x^2 + y^2 = z^2\\]
+            """,
+            eventKind: "text_delta",
+            runID: "run-1"
+        )
+        model.transcript.append(TranscriptItem(
+            id: "run-1-status",
+            role: .status,
+            text: "Completed",
+            runID: "run-1",
+            status: "completed"
+        ))
+        await settle(window: window, controller: controller)
+
+        collectionView = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        scrollView = try #require(collectionView.enclosingScrollView)
+        let itemFrames = (0..<collectionView.numberOfItems(inSection: 0)).compactMap { index in
+            collectionView.layoutAttributesForItem(at: IndexPath(item: index, section: 0))?.frame
+        }
+        for pair in zip(itemFrames, itemFrames.dropFirst()) {
+            #expect(pair.0.maxY <= pair.1.minY + 1)
+        }
+        let visibleContentBottom = scrollView.documentVisibleRect.maxY
+            - scrollView.contentInsets.bottom
+        #expect(try #require(itemFrames.last).maxY <= visibleContentBottom + 1)
         #expect(distanceFromBottom(of: scrollView) <= 48)
     }
 
@@ -2497,10 +3179,12 @@ struct TranscriptRenderingTests {
 
     private func distanceFromBottom(of scrollView: NSScrollView) -> CGFloat {
         guard let documentView = scrollView.documentView else { return 0 }
-        let visible = scrollView.documentVisibleRect
-        return documentView.isFlipped
-            ? max(0, documentView.bounds.maxY - visible.maxY)
-            : max(0, visible.minY - documentView.bounds.minY)
+        let geometry = TranscriptScrollGeometry(
+            documentHeight: documentView.bounds.height,
+            viewportHeight: scrollView.documentVisibleRect.height,
+            bottomObstructionHeight: scrollView.contentInsets.bottom
+        )
+        return geometry.distanceFromTail(originY: scrollView.documentVisibleRect.origin.y)
     }
 
     private func contrastingPixelCount(
@@ -2541,9 +3225,12 @@ struct TranscriptRenderingTests {
     private func scrollToBottom(_ scrollView: NSScrollView) {
         guard let documentView = scrollView.documentView else { return }
         let visible = scrollView.documentVisibleRect
-        let nextY = documentView.isFlipped
-            ? max(0, documentView.bounds.maxY - visible.height)
-            : documentView.bounds.minY
+        let geometry = TranscriptScrollGeometry(
+            documentHeight: documentView.bounds.height,
+            viewportHeight: visible.height,
+            bottomObstructionHeight: scrollView.contentInsets.bottom
+        )
+        let nextY = documentView.isFlipped ? geometry.maximumOriginY : documentView.bounds.minY
         scrollView.contentView.scroll(to: NSPoint(x: visible.origin.x, y: nextY))
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }

@@ -417,6 +417,17 @@ struct NativeComposerTextView: NSViewRepresentable {
 
 final class ComposerScrollView: NSScrollView {
     var heightBinding: Binding<CGFloat>?
+    private var measurementScheduled = false
+    private var lastMeasurement: Measurement?
+    private(set) var completedMeasurementCount = 0
+
+    private struct Measurement: Equatable {
+        let text: String
+        let width: CGFloat
+        let fontName: String
+        let fontSize: CGFloat
+        let height: CGFloat
+    }
 
     override func layout() {
         super.layout()
@@ -434,8 +445,12 @@ final class ComposerScrollView: NSScrollView {
     }
 
     func scheduleMeasurement() {
+        guard !measurementScheduled else { return }
+        measurementScheduled = true
         DispatchQueue.main.async { [weak self] in
-            self?.measureText()
+            guard let self else { return }
+            defer { self.measurementScheduled = false }
+            self.measureText()
         }
     }
 
@@ -446,21 +461,48 @@ final class ComposerScrollView: NSScrollView {
         else { return }
         let width = contentSize.width
         guard width > 40 else { return }
+        let font = textView.font ?? .preferredFont(forTextStyle: .body)
+        if let lastMeasurement,
+           lastMeasurement.text == textView.string,
+           lastMeasurement.width == width,
+           lastMeasurement.fontName == font.fontName,
+           lastMeasurement.fontSize == font.pointSize {
+            apply(height: lastMeasurement.height, to: heightBinding)
+            return
+        }
+        completedMeasurementCount += 1
         if abs(textView.frame.width - width) > 0.5 {
             textView.setFrameSize(NSSize(width: width, height: textView.frame.height))
         }
-        textContainer.containerSize = NSSize(
+        let containerSize = NSSize(
             width: width,
             height: CGFloat.greatestFiniteMagnitude
         )
+        if textContainer.containerSize != containerSize {
+            textContainer.containerSize = containerSize
+        }
         let nextHeight = ComposerHeightCalculator.height(
             for: textView.string,
             width: width,
-            font: textView.font ?? .preferredFont(forTextStyle: .body)
+            font: font
         )
-        hasVerticalScroller = nextHeight >= ComposerHeightCalculator.maximumHeight
-        guard abs(heightBinding.wrappedValue - nextHeight) > 0.5 else { return }
-        heightBinding.wrappedValue = nextHeight
+        lastMeasurement = Measurement(
+            text: textView.string,
+            width: width,
+            fontName: font.fontName,
+            fontSize: font.pointSize,
+            height: nextHeight
+        )
+        apply(height: nextHeight, to: heightBinding)
+    }
+
+    private func apply(height: CGFloat, to heightBinding: Binding<CGFloat>) {
+        let needsScroller = height >= ComposerHeightCalculator.maximumHeight
+        if hasVerticalScroller != needsScroller {
+            hasVerticalScroller = needsScroller
+        }
+        guard abs(heightBinding.wrappedValue - height) > 0.5 else { return }
+        heightBinding.wrappedValue = height
     }
 }
 #endif

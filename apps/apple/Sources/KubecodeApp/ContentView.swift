@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import KubecodeKit
+import KubecodeMacUI
 import KubecodeUI
 
 enum WorkbenchPresentationMetrics {
@@ -39,8 +40,76 @@ enum UserMessageBubbleMetrics {
     }
 }
 
-private enum TranscriptScrollAnchor {
-    static let bottom = "kubecode-transcript-bottom"
+private enum TranscriptSurfaceEntry: Identifiable, Hashable {
+    case revisionWarning(String)
+    case loadEarlier(isLoading: Bool)
+    case item(TranscriptItem)
+    case activityHeader(TranscriptRunActivity)
+    case runOutput(TranscriptRunOutput)
+    case activityStep(item: TranscriptItem, ownerID: String, isCurrent: Bool)
+    case activityLimit(ownerID: String, hiddenCount: Int, showsAll: Bool)
+    case sideQuestion(SideQuestion)
+
+    var id: String {
+        switch self {
+        case .revisionWarning: "revision-warning"
+        case .loadEarlier: "load-earlier"
+        case let .item(item): item.id
+        case let .activityHeader(activity): activity.id
+        case let .runOutput(output): output.id
+        case let .activityStep(item, ownerID, _): "\(ownerID)-step-\(item.id)"
+        case let .activityLimit(ownerID, _, _): "\(ownerID)-limit"
+        case let .sideQuestion(question): "side-question-\(question.id)"
+        }
+    }
+
+    var resizePolicy: NativeTranscriptResizePolicy {
+        guard case let .activityHeader(activity) = self,
+              !activity.isActive
+        else { return .immediate }
+        return .animated
+    }
+}
+
+private struct ComposerOverlayHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+@MainActor
+private struct TranscriptViewport: View {
+    let entries: [TranscriptSurfaceEntry]
+    let sessionID: String?
+    let outputRevision: String
+    let bottomInset: CGFloat
+    let scrollController: TranscriptScrollController
+    let layoutRevision: (String) -> Int
+    let rowBuilder: (TranscriptSurfaceEntry) -> AnyView
+
+    var body: some View {
+        NativeTranscriptCollectionView(
+            items: entries.map { entry in
+                var hasher = Hasher()
+                entry.hash(into: &hasher)
+                return NativeTranscriptItem(
+                    id: entry.id,
+                    contentRevision: hasher.finalize(),
+                    layoutRevision: layoutRevision(entry.id),
+                    resizePolicy: entry.resizePolicy
+                )
+            },
+            sessionID: sessionID,
+            outputRevision: outputRevision,
+            bottomInset: bottomInset,
+            scrollController: scrollController
+        ) { index in
+            guard entries.indices.contains(index) else { return AnyView(EmptyView()) }
+            return rowBuilder(entries[index])
+        }
+    }
 }
 
 private struct TurnEditRequest: Identifiable {
@@ -464,6 +533,7 @@ private struct TerminalLayoutNodeView: View {
 
 struct ContentView: View {
     @Bindable var model: AppModel
+    @Bindable var sessionWorkspace: SessionWorkspaceModel
     @Environment(\.workspaceTypography) private var typography
     @State private var renamingConversation: Conversation?
     @State private var renameDraft = ""
@@ -486,16 +556,8 @@ struct ContentView: View {
     @State private var teamConfirmation: TeamConfirmation?
     @State private var editingTurn: TurnEditRequest?
     @State private var branchingTurn: TurnBranchRequest?
-    @State private var composerHeight: CGFloat = ComposerHeightCalculator.minimumHeight
-    @State private var composerIsExpanded = false
-    @State private var openComposerProviderControlID: String?
-    @State private var usageIsPresented = false
-    @State private var composerPalettePresented = false
-    @State private var composerReferencePickerPresented = false
-    @State private var transcriptScrollState = TranscriptScrollState()
-    @State private var transcriptFollowTask: Task<Void, Never>?
-    @State private var autosaveScheduler = DocumentAutosaveScheduler()
     @State private var teamInputAnswers: [String: String] = [:]
+    @State private var composerOverlayHeight: CGFloat = 0
     @SceneStorage("navigation.showArchivedSessions") private var showArchivedSessions = false
     @SceneStorage("navigation.sessionAgentFilter") private var sessionAgentFilter = "all"
     @SceneStorage("navigation.sessionSort") private var sessionSort = SessionNavigationSort.activity.rawValue
@@ -504,8 +566,14 @@ struct ContentView: View {
     @AppStorage("editor.showIgnored") private var showIgnored = false
     @AppStorage("editor.showGenerated") private var showGenerated = false
 
+    init(model: AppModel, sessionWorkspace: SessionWorkspaceModel = SessionWorkspaceModel()) {
+        self.model = model
+        self.sessionWorkspace = sessionWorkspace
+    }
+
     var body: some View {
         onboardingLayout
+        .environment(\.markdownProjectResourceContext, model.markdownProjectResourceContext)
         .toolbarBackground(.hidden, for: .windowToolbar)
         .overlay(alignment: .top) {
             if let error = model.errorMessage {
@@ -592,16 +660,16 @@ struct ContentView: View {
         .sheet(isPresented: $model.isProjectBrowserPresented) {
             ProjectBrowserSheet(model: model)
         }
-        .sheet(isPresented: $model.isSessionSetupPresented) {
-            SessionSetupSheet(model: model)
+        .sheet(item: $model.sessionSetupRequest) { request in
+            SessionSetupSheet(model: model, initialAgentID: request.agentID)
         }
         .sheet(isPresented: $model.isQuickOpenPresented) {
             QuickOpenSheet(model: model)
         }
-        .sheet(isPresented: $composerReferencePickerPresented) {
+        .sheet(isPresented: $sessionWorkspace.composerReferencePickerPresented) {
             QuickOpenSheet(model: model) { entry in
                 model.insertComposerReference(entry)
-                composerReferencePickerPresented = false
+                sessionWorkspace.composerReferencePickerPresented = false
             }
         }
         .sheet(item: $selectedTeamTask) { task in
@@ -643,19 +711,18 @@ struct ContentView: View {
                   model.canSaveActiveDocument,
                   let path = model.activeDocument?.path
             else { return }
-            autosaveScheduler.schedule(key: path) {
+            sessionWorkspace.autosaveScheduler.schedule(key: path) {
                 model.autosaveDocument(path: path)
             }
         }
         .onChange(of: autosave) { _, enabled in
-            if !enabled { autosaveScheduler.cancelAll() }
+            if !enabled { sessionWorkspace.autosaveScheduler.cancelAll() }
         }
         .onChange(of: model.selectedProjectNeedsFolderAccess) { _, requiresAccess in
-            if requiresAccess { autosaveScheduler.cancelAll() }
+            if requiresAccess { sessionWorkspace.autosaveScheduler.cancelAll() }
         }
         .onDisappear {
-            autosaveScheduler.cancelAll()
-            transcriptFollowTask?.cancel()
+            sessionWorkspace.autosaveScheduler.cancelAll()
         }
     }
 
@@ -722,7 +789,7 @@ struct ContentView: View {
             Picker("Agent", selection: sessionAgentFilterBinding) {
                 Text("All Agents").tag("all")
                 ForEach(AgentID.allCases, id: \.rawValue) { agentID in
-                    Text(agentID.displayName).tag(agentID.rawValue)
+                    AgentIdentityLabel(agentID: agentID).tag(agentID.rawValue)
                 }
             }
             Picker("Sort Sessions", selection: sessionSortBinding) {
@@ -889,14 +956,19 @@ struct ContentView: View {
     }
 
     private var workspaceSidebar: some View {
-        VStack(spacing: 0) {
-            VSplitView {
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
                 activitySidebar
-                    .frame(minHeight: 260, idealHeight: 430)
-                inspector
-                    .frame(minHeight: 240, idealHeight: 360)
+                    .frame(minHeight: 260, maxHeight: .infinity)
+                    .background(WorkspaceLayoutAnchor(identifier: "navigator.sessions-area.layout"))
+                workspaceExplorer
+                    .frame(
+                        height: explorerHeight(availableHeight: geometry.size.height),
+                        alignment: .bottom
+                    )
+                    .clipped()
+                WorkspaceRuntimeFooter(model: model)
             }
-            WorkspaceRuntimeFooter(model: model)
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .background(WorkspaceLayoutAnchor(identifier: "navigator.column.layout"))
@@ -1431,7 +1503,11 @@ struct ContentView: View {
             }
             HStack(spacing: 10) {
                 ForEach(model.availableAgents) { agent in
-                    Button(agent.id.displayName) { model.isSessionSetupPresented = true }
+                    Button {
+                        model.presentSessionSetup(preferredAgent: agent.id)
+                    } label: {
+                        AgentIdentityLabel(agentID: agent.id, iconSize: 18)
+                    }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.large)
                 }
@@ -1492,104 +1568,63 @@ struct ContentView: View {
                 Divider()
             }
 
-            ScrollViewReader { proxy in
-                ZStack(alignment: .bottom) {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 18) {
-                            if model.revisionState.workspaceWarning != nil {
-                                revisionWorkspaceWarning
-                            }
-                            if model.historyCursor != nil {
-                                Button {
-                                    let anchor = model.transcript.first?.id
-                                    Task {
-                                        await model.loadEarlierHistory()
-                                        if let anchor { proxy.scrollTo(anchor, anchor: .top) }
-                                    }
-                                } label: {
-                                    if model.isLoadingEarlierHistory {
-                                        ProgressView().controlSize(.small)
-                                    } else {
-                                        Label("Load Earlier", systemImage: "arrow.up.circle")
-                                    }
-                                }
-                                .buttonStyle(.borderless)
-                                .disabled(model.isLoadingEarlierHistory)
-                                .frame(maxWidth: .infinity)
-                            }
-                            ForEach(TranscriptPresentationEntry.groupingTools(in: model.transcript)) { entry in
-                                transcriptPresentationRow(entry)
-                                    .id(entry.id)
-                            }
-                            ForEach(model.interaction.sideQuestions) { question in
-                                sideQuestionCard(question)
-                                    .id("side-question-\(question.id)")
-                            }
-                            Color.clear
-                                .frame(height: transcriptBottomClearance)
-                                .id(TranscriptScrollAnchor.bottom)
-                        }
-                        .padding(.horizontal, 18)
-                        .padding(.top, 18)
-                        .background {
-#if os(macOS)
-                            NativeTranscriptScrollObserver { isNearBottom in
-                                transcriptScrollState.viewportDidChange(isNearBottom: isNearBottom)
-                            }
-#endif
-                        }
+            ZStack(alignment: .bottom) {
+                TranscriptViewport(
+                    entries: transcriptSurfaceEntries,
+                    sessionID: model.selectedConversationID,
+                    outputRevision: transcriptScrollMarker,
+                    bottomInset: transcriptBottomClearance,
+                    scrollController: sessionWorkspace.transcriptScrollController,
+                    layoutRevision: { ownerID in
+                        sessionWorkspace.transcriptLayoutRevision(
+                            sessionID: model.selectedConversationID,
+                            ownerID: ownerID
+                        )
                     }
-                    .onChange(of: transcriptScrollMarker) {
-                        guard transcriptScrollState.outputDidChange() else { return }
-                        scrollTranscriptToBottom(using: proxy)
-                    }
-                    .onChange(of: model.selectedConversationID) {
-                        transcriptScrollState.resumeFollowing()
-                        scrollTranscriptToBottom(using: proxy)
-                    }
-                    .onAppear {
-                        transcriptScrollState.resumeFollowing()
-                        scrollTranscriptToBottom(using: proxy)
-                    }
+                ) { entry in
+                    AnyView(transcriptSurfaceRow(entry))
+                }
 
-                    if !transcriptScrollState.followsOutput {
-                        Button {
-                            transcriptScrollState.resumeFollowing()
-                            withAnimation(.easeOut(duration: 0.18)) {
-                                proxy.scrollTo(TranscriptScrollAnchor.bottom, anchor: .bottom)
-                            }
-                        } label: {
-                            Image(systemName: transcriptScrollState.hasUnseenOutput
-                                ? "arrow.down.circle.fill"
-                                : "arrow.down")
-                                .frame(width: 22, height: 22)
-                        }
-                        .buttonStyle(.bordered)
-                        .buttonBorderShape(.circle)
-                        .controlSize(.large)
-                        .help("Scroll to Latest Output")
-                        .workspaceAccessibility(.scrollLatestOutput)
-                        .padding(.bottom, transcriptJumpButtonBottomPadding)
-                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                TranscriptJumpToLatestButton(
+                    controller: sessionWorkspace.transcriptScrollController,
+                    action: {
+                        sessionWorkspace.transcriptScrollController.resumeFollowing()
                     }
+                )
+                    .padding(.bottom, transcriptJumpButtonBottomPadding)
 
-                    if !model.selectedConversationIsReadOnly {
-                        VStack(spacing: 0) {
-                            if let run = model.runs.last, model.canUndoTurn(run.id) {
-                                Button("Undo Turn", systemImage: "arrow.uturn.backward") {
-                                    model.undoTurn(run.id)
-                                }
-                                .buttonStyle(.borderless)
-                                .disabled(model.isChangingRevision)
-                                .frame(maxWidth: 1100, alignment: .leading)
-                                .padding(.bottom, 6)
+                if !model.selectedConversationIsReadOnly {
+                    VStack(spacing: 0) {
+                        if let run = model.runs.last, model.canUndoTurn(run.id) {
+                            Button("Undo Turn", systemImage: "arrow.uturn.backward") {
+                                model.undoTurn(run.id)
                             }
-                            interactionPrompt
-                            composerControls
+                            .buttonStyle(.borderless)
+                            .disabled(model.isChangingRevision)
+                            .frame(maxWidth: 1100, alignment: .leading)
+                            .padding(.bottom, 6)
                         }
-                        .padding(.horizontal, 18)
-                        .padding(.top, 8)
-                        .padding(.bottom, 14)
+                        interactionPrompt
+                        composerControls
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.top, 8)
+                    .padding(.bottom, 14)
+                    .background {
+                        GeometryReader { geometry in
+                            Color.clear.preference(
+                                key: ComposerOverlayHeightKey.self,
+                                value: geometry.size.height
+                            )
+                        }
+                    }
+                    .onPreferenceChange(ComposerOverlayHeightKey.self) { height in
+                        guard abs(composerOverlayHeight - height) >= 0.5 else { return }
+                        var transaction = Transaction()
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            composerOverlayHeight = height
+                        }
                     }
                 }
             }
@@ -1724,43 +1759,43 @@ struct ContentView: View {
         )
         .animation(
             .easeInOut(duration: ComposerPresentationMetrics.transitionDuration),
-            value: composerHeight
+            value: sessionWorkspace.composerHeight
         )
         .animation(
             .easeInOut(duration: ComposerPresentationMetrics.transitionDuration),
             value: composerUsesExpandedLayout
         )
-        .onChange(of: composerHeight) { _, height in
+        .onChange(of: sessionWorkspace.composerHeight) { _, height in
             let shouldExpand = height > ComposerHeightCalculator.minimumHeight + 0.5
-            guard shouldExpand != composerIsExpanded else { return }
+            guard shouldExpand != sessionWorkspace.composerIsExpanded else { return }
             withAnimation(.easeInOut(duration: ComposerPresentationMetrics.transitionDuration)) {
-                composerIsExpanded = shouldExpand
+                sessionWorkspace.composerIsExpanded = shouldExpand
             }
         }
         .onChange(of: model.composer) { _, value in
-            guard value.isEmpty, composerIsExpanded else { return }
+            guard value.isEmpty, sessionWorkspace.composerIsExpanded else { return }
             withAnimation(.easeInOut(duration: ComposerPresentationMetrics.transitionDuration)) {
-                composerIsExpanded = false
+                sessionWorkspace.composerIsExpanded = false
             }
         }
     }
 
     private var composerBarHeight: CGFloat {
         composerUsesExpandedLayout
-            ? ComposerPresentationMetrics.expandedBarHeight(contentHeight: composerHeight)
-            : ComposerPresentationMetrics.barHeight(contentHeight: composerHeight)
+            ? ComposerPresentationMetrics.expandedBarHeight(contentHeight: sessionWorkspace.composerHeight)
+            : ComposerPresentationMetrics.barHeight(contentHeight: sessionWorkspace.composerHeight)
     }
 
     private var composerUsesExpandedLayout: Bool {
         ComposerPresentationMetrics.shouldUseExpandedLayout(
-            measuredHeight: composerHeight,
-            stateRequested: composerIsExpanded
+            measuredHeight: sessionWorkspace.composerHeight,
+            stateRequested: sessionWorkspace.composerIsExpanded
         )
     }
 
     private var composerContextMenu: some View {
         Button {
-            composerPalettePresented.toggle()
+            sessionWorkspace.composerPalettePresented.toggle()
         } label: {
             Text(Image(systemName: "plus"))
                 .font(.system(size: 19, weight: .medium))
@@ -1771,21 +1806,21 @@ struct ContentView: View {
         .buttonStyle(.plain)
         .help("Add Context")
         .workspaceAccessibility(.addContext)
-        .popover(isPresented: $composerPalettePresented, arrowEdge: .bottom) {
+        .popover(isPresented: $sessionWorkspace.composerPalettePresented, arrowEdge: .bottom) {
             ComposerCapabilityPalette(
                 commands: model.nativeCommands,
                 onChooseCommand: { command in
                     model.insertNativeCommand(command)
-                    composerPalettePresented = false
+                    sessionWorkspace.composerPalettePresented = false
                 },
                 onChooseFile: {
-                    composerPalettePresented = false
+                    sessionWorkspace.composerPalettePresented = false
                     Task { @MainActor in
                         await Task.yield()
-                        composerReferencePickerPresented = true
+                        sessionWorkspace.composerReferencePickerPresented = true
                     }
                 },
-                onDismiss: { composerPalettePresented = false }
+                onDismiss: { sessionWorkspace.composerPalettePresented = false }
             )
         }
     }
@@ -1801,11 +1836,11 @@ struct ContentView: View {
 #if os(macOS)
             NativeComposerTextView(
                 text: $model.composer,
-                height: $composerHeight,
+                height: $sessionWorkspace.composerHeight,
                 commands: model.nativeCommands,
                 onSubmit: { model.sendMessage() }
             )
-            .frame(height: composerHeight)
+            .frame(height: sessionWorkspace.composerHeight)
 #else
             TextField("Ask the Agent…", text: $model.composer, axis: .vertical)
                 .textFieldStyle(.plain)
@@ -1813,7 +1848,7 @@ struct ContentView: View {
 #endif
         }
         .font(typography.swiftUIFont(for: .body))
-        .frame(height: composerHeight)
+        .frame(height: sessionWorkspace.composerHeight)
     }
 
     private var composerProviderControls: some View {
@@ -2030,22 +2065,174 @@ struct ContentView: View {
     }
 
     private var transcriptBottomClearance: CGFloat {
-        model.selectedConversationIsReadOnly ? 24 : max(composerBarHeight + 32, 84)
+        guard !model.selectedConversationIsReadOnly else { return 24 }
+        return max(max(composerOverlayHeight + 8, composerBarHeight + 32), 84)
     }
 
     private var transcriptJumpButtonBottomPadding: CGFloat {
-        model.selectedConversationIsReadOnly ? 16 : composerBarHeight + 28
+        model.selectedConversationIsReadOnly ? 16 : transcriptBottomClearance - 4
     }
 
-    private func scrollTranscriptToBottom(using proxy: ScrollViewProxy) {
-        transcriptFollowTask?.cancel()
-        transcriptFollowTask = Task { @MainActor in
-            await Task.yield()
-            guard !Task.isCancelled, transcriptScrollState.followsOutput else { return }
-            proxy.scrollTo(TranscriptScrollAnchor.bottom, anchor: .bottom)
-            try? await Task.sleep(for: .milliseconds(16))
-            guard !Task.isCancelled, transcriptScrollState.followsOutput else { return }
-            proxy.scrollTo(TranscriptScrollAnchor.bottom, anchor: .bottom)
+    private var transcriptSurfaceEntries: [TranscriptSurfaceEntry] {
+        var entries: [TranscriptSurfaceEntry] = []
+        if model.revisionState.workspaceWarning != nil {
+            entries.append(.revisionWarning(revisionWorkspaceWarningMessage))
+        }
+        if model.historyCursor != nil {
+            entries.append(.loadEarlier(isLoading: model.isLoadingEarlierHistory))
+        }
+        for entry in TranscriptPresentation.entries(
+            items: model.transcript,
+            activeRunID: model.activeRun?.id
+        ) {
+            switch entry {
+            case let .item(item):
+                entries.append(.item(item))
+            case let .run(run):
+                entries.append(contentsOf: run.userItems.map(TranscriptSurfaceEntry.item))
+                if let activity = run.activity {
+                    entries.append(.activityHeader(activity))
+                }
+                if let output = run.output {
+                    entries.append(.runOutput(output))
+                }
+                if let activity = run.activity {
+                    entries.append(contentsOf: activityDetailSurfaceEntries(activity))
+                }
+                entries.append(contentsOf: run.trailingItems.map(TranscriptSurfaceEntry.item))
+            }
+        }
+        entries.append(contentsOf: model.interaction.sideQuestions.map(
+            TranscriptSurfaceEntry.sideQuestion
+        ))
+        return entries
+    }
+
+    @ViewBuilder
+    private func transcriptSurfaceRow(_ entry: TranscriptSurfaceEntry) -> some View {
+        switch entry {
+        case .revisionWarning:
+            revisionWorkspaceWarning
+        case let .loadEarlier(isLoading):
+            Button {
+                Task { await model.loadEarlierHistory() }
+            } label: {
+                if isLoading {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Label("Load Earlier", systemImage: "arrow.up.circle")
+                }
+            }
+            .buttonStyle(.borderless)
+            .disabled(isLoading)
+            .frame(maxWidth: .infinity)
+        case let .item(item):
+            transcriptRow(item)
+        case let .activityHeader(activity):
+            RunActivityHeaderRow(
+                activity: activity,
+                isExpanded: transcriptExpansionBinding(
+                    for: activity.id,
+                    ownerID: activity.id,
+                    defaultExpanded: activity.defaultExpanded
+                )
+            )
+        case let .runOutput(output):
+            runOutputRow(output)
+        case let .activityStep(item, ownerID, isCurrent):
+            activityStepRow(item, ownerID: ownerID, isCurrent: isCurrent)
+                .padding(.leading, 2)
+        case let .activityLimit(ownerID, hiddenCount, showsAll):
+            Button {
+                sessionWorkspace.setShowsAllTranscriptSteps(
+                    !showsAll,
+                    sessionID: model.selectedConversationID,
+                    ownerID: ownerID
+                )
+            } label: {
+                Text(showsAll
+                    ? String(localized: "Show recent only")
+                    : String(
+                        format: String(localized: "Show %lld earlier steps"),
+                        Int64(hiddenCount)
+                    ))
+            }
+            .buttonStyle(.plain)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        case let .sideQuestion(question):
+            sideQuestionCard(question)
+        }
+    }
+
+    private func activityDetailSurfaceEntries(
+        _ activity: TranscriptRunActivity
+    ) -> [TranscriptSurfaceEntry] {
+        let ownerID = activity.id
+        var entries: [TranscriptSurfaceEntry] = []
+        guard sessionWorkspace.resolvedTranscriptExpansion(
+            sessionID: model.selectedConversationID,
+            itemID: ownerID,
+            defaultExpanded: activity.defaultExpanded
+        ) else { return entries }
+
+        let recentLimit = 8
+        let showsAll = sessionWorkspace.showsAllTranscriptSteps(
+            sessionID: model.selectedConversationID,
+            ownerID: ownerID
+        )
+        let hiddenCount = activity.hiddenItemCount(limit: recentLimit)
+        if hiddenCount > 0 {
+            entries.append(.activityLimit(
+                ownerID: ownerID,
+                hiddenCount: hiddenCount,
+                showsAll: showsAll
+            ))
+        }
+        let visible = showsAll ? activity.items : activity.recentItems(limit: recentLimit)
+        entries.append(contentsOf: visible.map { item in
+            .activityStep(
+                item: item,
+                ownerID: ownerID,
+                isCurrent: activity.isActive && item.id == activity.items.last?.id
+            )
+        })
+        return entries
+    }
+
+    @ViewBuilder
+    private func runOutputRow(_ output: TranscriptRunOutput) -> some View {
+        switch output.phase {
+        case .update:
+            VStack(alignment: .leading, spacing: 5) {
+                Label("Update", systemImage: "text.bubble")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(output.text)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+        case .final:
+            AgentMarkdownView(
+                source: output.text,
+                copyResponseSource: output.text
+            )
+            .frame(maxWidth: 760, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        case .partial:
+            VStack(alignment: .leading, spacing: 5) {
+                Label("Partial output", systemImage: "text.bubble")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                AgentMarkdownView(
+                    source: output.text,
+                    copyResponseSource: output.text
+                )
+                .frame(maxWidth: 720, alignment: .leading)
+            }
         }
     }
 
@@ -2063,12 +2250,38 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func transcriptPresentationRow(_ entry: TranscriptPresentationEntry) -> some View {
-        switch entry {
-        case let .item(item):
-            transcriptRow(item)
-        case let .tools(_, tools):
-            ToolUseTranscriptGroup(items: tools)
+    private func activityStepRow(
+        _ item: TranscriptItem,
+        ownerID: String,
+        isCurrent: Bool
+    ) -> some View {
+        switch item.role {
+        case .thinking:
+            ThinkingTranscriptRow(
+                item: item,
+                isCurrent: isCurrent,
+                isExpanded: transcriptExpansionBinding(for: item.id, ownerID: ownerID)
+            )
+        case .tool:
+            ToolUseTranscriptRow(
+                item: item,
+                isCurrent: isCurrent,
+                isExpanded: transcriptExpansionBinding(for: item.id, ownerID: ownerID)
+            )
+        case .agent:
+            VStack(alignment: .leading, spacing: 5) {
+                Label("Update", systemImage: "text.bubble")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                AgentMarkdownView(
+                    source: item.text,
+                    tone: .secondary,
+                    isStreaming: isCurrent
+                )
+                    .frame(maxWidth: 720, alignment: .leading)
+            }
+        case .user, .system, .status:
+            EmptyView()
         }
     }
 
@@ -2100,10 +2313,15 @@ struct ContentView: View {
         case .thinking:
             ThinkingTranscriptRow(
                 item: item,
-                isStreaming: model.activeRun?.id == item.runID
+                isCurrent: model.activeRun?.id == item.runID,
+                isExpanded: transcriptExpansionBinding(for: item.id, ownerID: item.id)
             )
         case .tool:
-            ToolUseTranscriptGroup(items: [item])
+            ToolUseTranscriptRow(
+                item: item,
+                isCurrent: model.activeRun?.id == item.runID,
+                isExpanded: transcriptExpansionBinding(for: item.id, ownerID: item.id)
+            )
         case .system:
             VStack(alignment: .leading, spacing: 5) {
                 Label("Error", systemImage: "exclamationmark.triangle")
@@ -2155,6 +2373,48 @@ struct ContentView: View {
         case "timed_out", "interrupted": .orange
         default: .secondary
         }
+    }
+
+    private func transcriptExpansionBinding(
+        for itemID: String,
+        ownerID: String,
+        defaultExpanded: Bool = false
+    ) -> Binding<Bool> {
+        Binding(
+            get: {
+                sessionWorkspace.resolvedTranscriptExpansion(
+                    sessionID: model.selectedConversationID,
+                    itemID: itemID,
+                    defaultExpanded: defaultExpanded
+                )
+            },
+            set: { expanded in
+                sessionWorkspace.setTranscriptExpanded(
+                    expanded,
+                    sessionID: model.selectedConversationID,
+                    itemID: itemID,
+                    ownerID: ownerID
+                )
+            }
+        )
+    }
+
+    private func transcriptShowsAllStepsBinding(ownerID: String) -> Binding<Bool> {
+        Binding(
+            get: {
+                sessionWorkspace.showsAllTranscriptSteps(
+                    sessionID: model.selectedConversationID,
+                    ownerID: ownerID
+                )
+            },
+            set: { showsAll in
+                sessionWorkspace.setShowsAllTranscriptSteps(
+                    showsAll,
+                    sessionID: model.selectedConversationID,
+                    ownerID: ownerID
+                )
+            }
+        )
     }
 
     private func documentEditor(_ document: TextDocument) -> some View {
@@ -2390,26 +2650,11 @@ struct ContentView: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
                 .background(.bar)
-                Divider()
             }
 
             Spacer(minLength: 0)
 
             VStack(spacing: 0) {
-                if model.explorerSections.changesExpanded {
-                    List { explorerChangesContent }
-                        .listStyle(.plain)
-                        .environment(\.defaultMinListRowHeight, 24)
-                        .frame(height: explorerChangesHeight)
-                }
-                explorerDisclosureHeader(
-                    "Changes",
-                    systemImage: "arrow.triangle.branch",
-                    detail: model.gitStatus.map { String($0.files.count) },
-                    isExpanded: explorerChangesExpanded
-                )
-                Divider()
-
                 if !model.agentPlanEntries.isEmpty {
                     if model.explorerSections.planExpanded {
                         List {
@@ -2419,7 +2664,7 @@ struct ContentView: View {
                         }
                         .listStyle(.plain)
                         .environment(\.defaultMinListRowHeight, 24)
-                        .frame(height: explorerPlanHeight)
+                        .frame(minHeight: 0, idealHeight: explorerPlanHeight, maxHeight: 180)
                     }
                     explorerDisclosureHeader(
                         "Agent Plan",
@@ -2427,8 +2672,22 @@ struct ContentView: View {
                         detail: "\(completedPlanEntries)/\(model.agentPlanEntries.count)",
                         isExpanded: explorerPlanExpanded
                     )
-                    Divider()
+                    .background(WorkspaceLayoutAnchor(identifier: "navigator.plan-header.layout"))
                 }
+
+                if model.explorerSections.changesExpanded {
+                    List { explorerChangesContent }
+                        .listStyle(.plain)
+                        .environment(\.defaultMinListRowHeight, 24)
+                        .frame(minHeight: 0, idealHeight: explorerChangesHeight, maxHeight: 260)
+                }
+                explorerDisclosureHeader(
+                    "Changes",
+                    systemImage: "arrow.triangle.branch",
+                    detail: model.gitStatus.map { String($0.files.count) },
+                    isExpanded: explorerChangesExpanded
+                )
+                .background(WorkspaceLayoutAnchor(identifier: "navigator.changes-header.layout"))
 
                 if model.explorerSections.filesExpanded {
                     List { explorerFilesContent }
@@ -2446,10 +2705,10 @@ struct ContentView: View {
                     detail: nil,
                     isExpanded: explorerFilesExpanded
                 )
+                .background(WorkspaceLayoutAnchor(identifier: "navigator.files-header.layout"))
             }
             .frame(
                 maxWidth: .infinity,
-                minHeight: 240,
                 idealHeight: 360,
                 maxHeight: .infinity,
                 alignment: .bottom
@@ -2480,7 +2739,6 @@ struct ContentView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(.bar)
     }
 
     private var folderAccessRequiredLabel: some View {
@@ -2722,6 +2980,26 @@ struct ContentView: View {
         return min(max(CGFloat(model.agentPlanEntries.count) * 30 + 8, 44), 180)
     }
 
+    private var explorerPreferredHeight: CGFloat {
+        let visibleHeaderCount = model.agentPlanEntries.isEmpty ? 2 : 3
+        let planHeight = model.agentPlanEntries.isEmpty ? 0 : explorerPlanHeight
+        let filesHeight: CGFloat = model.explorerSections.filesExpanded ? 120 : 0
+        let folderAccessHeight: CGFloat = model.selectedProjectNeedsFolderAccess ? 52 : 0
+        return CGFloat(visibleHeaderCount) * 30
+            + planHeight
+            + explorerChangesHeight
+            + filesHeight
+            + folderAccessHeight
+    }
+
+    private func explorerHeight(availableHeight: CGFloat) -> CGFloat {
+        let visibleHeaderCount = model.agentPlanEntries.isEmpty ? 2 : 3
+        let minimum = CGFloat(visibleHeaderCount) * 30
+            + (model.explorerSections.filesExpanded ? 120 : 0)
+        let maximum = max(minimum, availableHeight - 290)
+        return min(max(explorerPreferredHeight, minimum), maximum)
+    }
+
     private func planStatusSymbol(_ status: AgentPlanEntryStatus) -> String {
         switch status {
         case .completed: "checkmark.circle.fill"
@@ -2851,8 +3129,10 @@ struct ContentView: View {
             if model.selectedConversation != nil, !model.availableAgents.isEmpty {
                 Section("Agent TUI") {
                     ForEach(model.availableAgents) { agent in
-                        Button(agent.id.displayName, systemImage: "sparkles.rectangle.stack") {
+                        Button {
                             model.createTerminal(kind: TerminalKind(agentID: agent.id))
+                        } label: {
+                            AgentIdentityLabel(agentID: agent.id)
                         }
                     }
                 }
@@ -2865,7 +3145,7 @@ struct ContentView: View {
 
     private func providerControls(_ conversation: Conversation) -> some View {
         HStack(spacing: 9) {
-            Text(conversation.agentID.displayName)
+            AgentIdentityLabel(agentID: conversation.agentID, iconSize: 13)
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
@@ -2893,7 +3173,7 @@ struct ContentView: View {
         } label: {
             composerProviderControlLabel(
                 currentModeLabel,
-                isPresented: openComposerProviderControlID == controlID
+                isPresented: sessionWorkspace.openComposerProviderControlID == controlID
             )
         }
         .buttonStyle(.plain)
@@ -2908,7 +3188,7 @@ struct ContentView: View {
                         isSelected: mode.id == model.currentNativeModeID
                     ) {
                         model.setNativeMode(mode)
-                        openComposerProviderControlID = nil
+                        sessionWorkspace.openComposerProviderControlID = nil
                     }
                 }
             }
@@ -2924,7 +3204,7 @@ struct ContentView: View {
         } label: {
             composerProviderControlLabel(
                 currentConfigLabel(config),
-                isPresented: openComposerProviderControlID == controlID
+                isPresented: sessionWorkspace.openComposerProviderControlID == controlID
             )
         }
         .buttonStyle(.plain)
@@ -2938,7 +3218,7 @@ struct ContentView: View {
                         isSelected: config.currentValue == choice.value
                     ) {
                         model.setNativeConfig(config, choice: choice)
-                        openComposerProviderControlID = nil
+                        sessionWorkspace.openComposerProviderControlID = nil
                     }
                 }
             }
@@ -3026,16 +3306,16 @@ struct ContentView: View {
 
     private func toggleComposerProviderControl(_ id: String) {
         withAnimation(.easeInOut(duration: ComposerPresentationMetrics.transitionDuration)) {
-            openComposerProviderControlID = openComposerProviderControlID == id ? nil : id
+            sessionWorkspace.openComposerProviderControlID = sessionWorkspace.openComposerProviderControlID == id ? nil : id
         }
     }
 
     private func composerProviderControlBinding(_ id: String) -> Binding<Bool> {
         Binding(
-            get: { openComposerProviderControlID == id },
+            get: { sessionWorkspace.openComposerProviderControlID == id },
             set: { isPresented in
-                if isPresented { openComposerProviderControlID = id }
-                else if openComposerProviderControlID == id { openComposerProviderControlID = nil }
+                if isPresented { sessionWorkspace.openComposerProviderControlID = id }
+                else if sessionWorkspace.openComposerProviderControlID == id { sessionWorkspace.openComposerProviderControlID = nil }
             }
         )
     }
@@ -3085,7 +3365,7 @@ struct ContentView: View {
 
     private func agentUsageControl(_ usage: AgentUsage) -> some View {
         Button {
-            usageIsPresented.toggle()
+            sessionWorkspace.usageIsPresented.toggle()
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "gauge.medium")
@@ -3098,7 +3378,7 @@ struct ContentView: View {
         .help("Context Usage")
         .workspaceAccessibility(.contextUsage)
         .accessibilityValue(Text(verbatim: "\(usage.percentage)%"))
-        .popover(isPresented: $usageIsPresented, arrowEdge: .top) {
+        .popover(isPresented: $sessionWorkspace.usageIsPresented, arrowEdge: .top) {
             agentUsagePopover(usage)
         }
     }
@@ -3177,39 +3457,25 @@ struct ContentView: View {
     }
 }
 
-enum TranscriptPresentationEntry: Identifiable, Hashable {
-    case item(TranscriptItem)
-    case tools(id: String, items: [TranscriptItem])
+private struct TranscriptJumpToLatestButton: View {
+    @Bindable var controller: TranscriptScrollController
+    let action: () -> Void
 
-    var id: String {
-        switch self {
-        case let .item(item): item.id
-        case let .tools(id, _): id
-        }
-    }
-
-    static func groupingTools(in items: [TranscriptItem]) -> [TranscriptPresentationEntry] {
-        var entries: [TranscriptPresentationEntry] = []
-        var index = items.startIndex
-        while index < items.endIndex {
-            let item = items[index]
-            guard item.role == .tool else {
-                entries.append(.item(item))
-                index = items.index(after: index)
-                continue
+    var body: some View {
+        if !controller.followsOutput {
+            Button(action: action) {
+                Image(systemName: controller.hasUnseenOutput
+                    ? "arrow.down.circle.fill"
+                    : "arrow.down")
+                    .frame(width: 22, height: 22)
             }
-
-            var tools: [TranscriptItem] = []
-            let runID = item.runID
-            while index < items.endIndex,
-                  items[index].role == .tool,
-                  items[index].runID == runID {
-                tools.append(items[index])
-                index = items.index(after: index)
-            }
-            entries.append(.tools(id: tools[0].id, items: tools))
+            .buttonStyle(.bordered)
+            .buttonBorderShape(.circle)
+            .controlSize(.large)
+            .help("Scroll to Latest Output")
+            .workspaceAccessibility(.scrollLatestOutput)
+            .transition(.opacity.combined(with: .move(edge: .bottom)))
         }
-        return entries
     }
 }
 
@@ -3226,67 +3492,315 @@ private struct UserMessageBubble: View {
     }
 }
 
-private struct ThinkingTranscriptRow: View {
-    let item: TranscriptItem
-    let isStreaming: Bool
-    @State private var isExpanded: Bool
+private struct TranscriptDisclosureGroup<Label: View, Content: View>: View {
+    @Binding var isExpanded: Bool
+    private let content: () -> Content
+    private let label: () -> Label
 
-    init(item: TranscriptItem, isStreaming: Bool) {
-        self.item = item
-        self.isStreaming = isStreaming
-        _isExpanded = State(initialValue: isStreaming)
+    init(
+        isExpanded: Binding<Bool>,
+        @ViewBuilder content: @escaping () -> Content,
+        @ViewBuilder label: @escaping () -> Label
+    ) {
+        _isExpanded = isExpanded
+        self.content = content
+        self.label = label
     }
 
     var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            AgentMarkdownView(source: item.text, tone: .secondary)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                var transaction = Transaction()
+                transaction.animation = nil
+                withTransaction(transaction) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .frame(width: 10, height: 12)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        .animation(.easeOut(duration: 0.12), value: isExpanded)
+                    label()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                content()
+                    .transition(.identity)
+                    .transaction { $0.animation = nil }
+            }
+        }
+    }
+}
+
+private struct ThinkingTranscriptRow: View {
+    let item: TranscriptItem
+    let isCurrent: Bool
+    @Binding var isExpanded: Bool
+
+    init(item: TranscriptItem, isCurrent: Bool, isExpanded: Binding<Bool>) {
+        self.item = item
+        self.isCurrent = isCurrent
+        _isExpanded = isExpanded
+    }
+
+    var body: some View {
+        TranscriptDisclosureGroup(isExpanded: $isExpanded) {
+            AgentMarkdownView(
+                source: item.text,
+                tone: .secondary,
+                isStreaming: isCurrent
+            )
                 .font(.callout)
                 .frame(maxWidth: 720, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 6)
         } label: {
             HStack(spacing: 7) {
-                if isStreaming { ProgressView().controlSize(.mini) }
+                if isCurrent { ProgressView().controlSize(.mini) }
                 else { Image(systemName: "brain") }
-                Text(isStreaming ? "Thinking" : "Thought")
+                Text(thoughtSummary)
+                    .lineLimit(1)
             }
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
         }
-        .frame(maxWidth: 760, alignment: .leading)
-        .onChange(of: isStreaming) { _, streaming in
-            isExpanded = streaming
-        }
+        .frame(maxWidth: 720, alignment: .leading)
+    }
+
+    private var thoughtSummary: String {
+        let firstLine = item.text
+            .split(whereSeparator: \.isNewline)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let firstLine, !firstLine.isEmpty else { return String(localized: "Thought") }
+        return firstLine
     }
 }
 
-private struct ToolUseTranscriptGroup: View {
-    let items: [TranscriptItem]
-    @State private var isExpanded = false
+private struct RunActivityHeaderRow: View {
+    let activity: TranscriptRunActivity
+    @Binding var isExpanded: Bool
 
     var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(items) { item in
-                    ToolUseTranscriptRow(item: item)
+        Button {
+            isExpanded.toggle()
+        } label: {
+            HStack(spacing: 7) {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .frame(width: 10)
+                activitySymbol
+                Text(activityLabel)
+                    .lineLimit(1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(activity.status == "failed" ? .red : .secondary)
+        .frame(maxWidth: 760, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var activitySymbol: some View {
+        if activity.isActive {
+            ProgressView().controlSize(.mini)
+        } else if activity.status == "completed" {
+            Image(systemName: "checkmark.circle")
+        } else if activity.status != nil {
+            Image(systemName: "exclamationmark.circle")
+        } else {
+            Image(systemName: "sparkles")
+        }
+    }
+
+    private var activityLabel: String {
+        let title: String
+        if activity.isActive {
+            title = String(localized: "Working")
+        } else if activity.status == "completed" {
+            title = String(localized: "Worked")
+        } else if activity.status != nil {
+            title = String(localized: "Stopped")
+        } else {
+            title = String(localized: "Activity")
+        }
+        let stepUnit = activity.stepCount == 1
+            ? String(localized: "step")
+            : String(localized: "steps")
+        let steps = "\(activity.stepCount) \(stepUnit)"
+        guard activity.toolCount > 0 else { return "\(title) · \(steps)" }
+        let toolUnit = activity.toolCount == 1
+            ? String(localized: "tool")
+            : String(localized: "tools")
+        return "\(title) · \(steps) · \(activity.toolCount) \(toolUnit)"
+    }
+}
+
+private struct RunActivityTranscriptRow: View {
+    private static let recentStepLimit = 8
+
+    let activity: TranscriptRunActivity
+    @Binding var isExpanded: Bool
+    @Binding var showsAllSteps: Bool
+    let expansionBindingForItem: (String) -> Binding<Bool>
+
+    var body: some View {
+        TranscriptDisclosureGroup(isExpanded: $isExpanded) {
+            VStack(alignment: .leading, spacing: 9) {
+                if hiddenStepCount > 0, !showsAllSteps {
+                    Button {
+                        showsAllSteps = true
+                    } label: {
+                        Text(String(
+                            format: String(localized: "Show %lld earlier steps"),
+                            Int64(hiddenStepCount)
+                        ))
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                } else if activity.items.count > Self.recentStepLimit, showsAllSteps {
+                    Button("Show recent only") {
+                        showsAllSteps = false
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                ForEach(visibleItems) { item in
+                    activityStep(item, isCurrent: activity.isActive && item.id == activity.items.last?.id)
                 }
             }
-            .padding(.top, 6)
+            .padding(.top, 7)
+            .padding(.leading, 2)
         } label: {
-            Label("Tool Use", systemImage: "wrench.and.screwdriver")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+            HStack(spacing: 7) {
+                activitySymbol
+                Text(activityLabel)
+                    .lineLimit(1)
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(activity.status == "failed" ? .red : .secondary)
         }
         .frame(maxWidth: 760, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func activityStep(_ item: TranscriptItem, isCurrent: Bool) -> some View {
+        switch item.role {
+        case .thinking:
+            ThinkingTranscriptRow(
+                item: item,
+                isCurrent: isCurrent,
+                isExpanded: expansionBindingForItem(item.id)
+            )
+        case .tool:
+            ToolUseTranscriptRow(
+                item: item,
+                isCurrent: isCurrent,
+                isExpanded: expansionBindingForItem(item.id)
+            )
+        case .agent:
+            VStack(alignment: .leading, spacing: 5) {
+                Label("Update", systemImage: "text.bubble")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                AgentMarkdownView(source: item.text, tone: .secondary)
+                    .frame(maxWidth: 720, alignment: .leading)
+            }
+        case .user, .system, .status:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private var activitySymbol: some View {
+        if activity.isActive {
+            ProgressView().controlSize(.mini)
+        } else if activity.status == "completed" {
+            Image(systemName: "checkmark.circle")
+        } else if activity.status != nil {
+            Image(systemName: "exclamationmark.circle")
+        } else {
+            Image(systemName: "sparkles")
+        }
+    }
+
+    private var visibleItems: [TranscriptItem] {
+        showsAllSteps ? activity.items : activity.recentItems(limit: Self.recentStepLimit)
+    }
+
+    private var hiddenStepCount: Int {
+        activity.hiddenItemCount(limit: Self.recentStepLimit)
+    }
+
+    private var activityLabel: String {
+        let title: String
+        if activity.isActive {
+            title = String(localized: "Working")
+        } else if activity.status == "completed" {
+            title = String(localized: "Worked")
+        } else if activity.status != nil {
+            title = String(localized: "Stopped")
+        } else {
+            title = String(localized: "Activity")
+        }
+        let steps = stepCountLabel
+        guard activity.toolCount > 0 else { return "\(title) · \(steps)" }
+        return "\(title) · \(steps) · \(toolCountLabel)"
+    }
+
+    private var stepCountLabel: String {
+        let unit = activity.stepCount == 1
+            ? String(localized: "step")
+            : String(localized: "steps")
+        return "\(activity.stepCount) \(unit)"
+    }
+
+    private var toolCountLabel: String {
+        let unit = activity.toolCount == 1
+            ? String(localized: "tool")
+            : String(localized: "tools")
+        return "\(activity.toolCount) \(unit)"
+    }
+}
+
+struct TranscriptActivityDisclosureState: Equatable {
+    private(set) var userValue: Bool?
+
+    func resolved(defaultExpanded: Bool) -> Bool {
+        userValue ?? defaultExpanded
+    }
+
+    mutating func userSet(_ value: Bool) {
+        userValue = value
     }
 }
 
 private struct ToolUseTranscriptRow: View {
     let item: TranscriptItem
-    @State private var isExpanded = false
+    let isCurrent: Bool
+    @Binding var isExpanded: Bool
+
+    init(
+        item: TranscriptItem,
+        isCurrent: Bool = false,
+        isExpanded: Binding<Bool>
+    ) {
+        self.item = item
+        self.isCurrent = isCurrent
+        _isExpanded = isExpanded
+    }
 
     var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
+        TranscriptDisclosureGroup(isExpanded: $isExpanded) {
             if let detail = item.detail, !detail.isEmpty {
                 Text(detail)
                     .font(.system(.caption, design: .monospaced))
@@ -3306,7 +3820,8 @@ private struct ToolUseTranscriptRow: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(10)
-        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
+        .padding(.vertical, 4)
+        .frame(maxWidth: 720, alignment: .leading)
     }
+
 }

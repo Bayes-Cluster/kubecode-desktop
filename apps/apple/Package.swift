@@ -10,13 +10,16 @@ let package = Package(
         .library(name: "KubecodeKit", targets: ["KubecodeKit"]),
         .library(name: "KubecodeCore", targets: ["KubecodeCore"]),
         .library(name: "KubecodeMacRuntime", targets: ["KubecodeMacRuntime"]),
+        .library(name: "KubecodeMarkdown", targets: ["KubecodeMarkdown"]),
         .library(name: "KubecodeUI", targets: ["KubecodeUI"]),
+        .library(name: "KubecodeMacUI", targets: ["KubecodeMacUI"]),
         .executable(name: "Kubecode", targets: ["KubecodeApp"]),
     ],
     dependencies: [
         .package(path: "Vendor/SwiftTerm"),
         .package(path: "Vendor/STTextView"),
         .package(path: "Vendor/SwiftMath"),
+        .package(path: "Vendor/SwiftMarkdown"),
     ],
     targets: [
         .target(
@@ -34,8 +37,20 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
+            name: "KubecodeMarkdown",
+            dependencies: [
+                .product(name: "Markdown", package: "SwiftMarkdown"),
+            ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
             name: "KubecodeUI",
             dependencies: ["KubecodeKit", "KubecodeCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "KubecodeMacUI",
+            dependencies: ["KubecodeUI"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(
@@ -44,7 +59,9 @@ let package = Package(
                 "KubecodeKit",
                 "KubecodeCore",
                 "KubecodeMacRuntime",
+                "KubecodeMarkdown",
                 "KubecodeUI",
+                "KubecodeMacUI",
                 "SwiftTerm",
                 "SwiftMath",
                 .product(name: "STTextView", package: "STTextView"),
@@ -68,13 +85,18 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
+            name: "KubecodeMarkdownTests",
+            dependencies: ["KubecodeMarkdown"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
             name: "KubecodeUITests",
             dependencies: ["KubecodeUI", "KubecodeKit"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
             name: "KubecodeAppTests",
-            dependencies: ["KubecodeApp", "KubecodeUI", "KubecodeMacRuntime"],
+            dependencies: ["KubecodeApp", "KubecodeUI", "KubecodeMacUI", "KubecodeMacRuntime"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

@@ -41,6 +41,191 @@ public struct TranscriptItem: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct TranscriptRunActivity: Identifiable, Hashable, Sendable {
+    public let runID: String
+    public let items: [TranscriptItem]
+    public let isActive: Bool
+    public let status: String?
+
+    public var id: String { "run-\(runID)-activity" }
+    public var stepCount: Int { items.count }
+    public var toolCount: Int { items.filter { $0.role == .tool }.count }
+    public var defaultExpanded: Bool { false }
+
+    public init(
+        runID: String,
+        items: [TranscriptItem],
+        isActive: Bool,
+        status: String?
+    ) {
+        self.runID = runID
+        self.items = items
+        self.isActive = isActive
+        self.status = status
+    }
+
+    public func recentItems(limit: Int) -> [TranscriptItem] {
+        guard limit > 0, items.count > limit else { return items }
+        return Array(items.suffix(limit))
+    }
+
+    public func hiddenItemCount(limit: Int) -> Int {
+        max(0, items.count - max(0, limit))
+    }
+}
+
+public enum TranscriptRunOutputPhase: Hashable, Sendable {
+    case update
+    case final
+    case partial
+}
+
+public struct TranscriptRunOutput: Identifiable, Hashable, Sendable {
+    public static let activePreviewLimit = 220
+
+    public let runID: String
+    public let text: String
+    public let phase: TranscriptRunOutputPhase
+    public let sourceItemID: String
+    public let sourceMessageID: String?
+
+    public var id: String { "run-\(runID)-output" }
+
+    public init(
+        runID: String,
+        text: String,
+        phase: TranscriptRunOutputPhase,
+        sourceItemID: String,
+        sourceMessageID: String? = nil
+    ) {
+        self.runID = runID
+        self.text = text
+        self.phase = phase
+        self.sourceItemID = sourceItemID
+        self.sourceMessageID = sourceMessageID
+    }
+}
+
+public struct TranscriptRunPresentation: Identifiable, Hashable, Sendable {
+    public let runID: String
+    public let userItems: [TranscriptItem]
+    public let activity: TranscriptRunActivity?
+    public let output: TranscriptRunOutput?
+    public let trailingItems: [TranscriptItem]
+
+    public var id: String { "run-\(runID)-presentation" }
+
+    public init(
+        runID: String,
+        userItems: [TranscriptItem],
+        activity: TranscriptRunActivity?,
+        output: TranscriptRunOutput?,
+        trailingItems: [TranscriptItem]
+    ) {
+        self.runID = runID
+        self.userItems = userItems
+        self.activity = activity
+        self.output = output
+        self.trailingItems = trailingItems
+    }
+}
+
+public enum TranscriptPresentationEntry: Identifiable, Hashable, Sendable {
+    case item(TranscriptItem)
+    case run(TranscriptRunPresentation)
+
+    public var id: String {
+        switch self {
+        case let .item(item): item.id
+        case let .run(run): run.id
+        }
+    }
+}
+
+public enum TranscriptPresentation {
+    public static func entries(
+        items: [TranscriptItem],
+        activeRunID: String?
+    ) -> [TranscriptPresentationEntry] {
+        var entries: [TranscriptPresentationEntry] = []
+        var index = items.startIndex
+
+        while index < items.endIndex {
+            guard let runID = items[index].runID else {
+                entries.append(.item(items[index]))
+                index = items.index(after: index)
+                continue
+            }
+
+            var runItems: [TranscriptItem] = []
+            while index < items.endIndex, items[index].runID == runID {
+                runItems.append(items[index])
+                index = items.index(after: index)
+            }
+            entries.append(.run(projectedRun(
+                for: runItems,
+                runID: runID,
+                isActive: activeRunID == runID
+            )))
+        }
+        return entries
+    }
+
+    private static func projectedRun(
+        for items: [TranscriptItem],
+        runID: String,
+        isActive: Bool
+    ) -> TranscriptRunPresentation {
+        let status = items.last(where: { $0.role == .status })?.status
+        let activityItems = items.filter { item in
+            switch item.role {
+            case .thinking, .tool: true
+            case .agent, .user, .system, .status: false
+            }
+        }
+        let activity = isActive || !activityItems.isEmpty
+            ? TranscriptRunActivity(
+                runID: runID,
+                items: activityItems,
+                isActive: isActive,
+                status: status
+            )
+            : nil
+        let output = items.last(where: { $0.role == .agent }).map { item in
+            let phase: TranscriptRunOutputPhase
+            let text: String
+            if status == "completed" {
+                phase = .final
+                text = item.text
+            } else if status != nil || !isActive {
+                phase = .partial
+                text = item.text
+            } else {
+                phase = .update
+                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                text = String(trimmed.prefix(TranscriptRunOutput.activePreviewLimit))
+            }
+            return TranscriptRunOutput(
+                runID: runID,
+                text: text,
+                phase: phase,
+                sourceItemID: item.id,
+                sourceMessageID: item.messageID
+            )
+        }
+        let trailingItems = items.filter { item in
+            item.role == .system || (item.role == .status && item.status != "completed")
+        }
+        return TranscriptRunPresentation(
+            runID: runID,
+            userItems: items.filter { $0.role == .user },
+            activity: activity,
+            output: output,
+            trailingItems: trailingItems
+        )
+    }
+}
+
 public enum TranscriptReducer {
     public static func items(run: AgentRun, events: [AgentEvent]) -> [TranscriptItem] {
         var items = [TranscriptItem(
@@ -73,6 +258,15 @@ public enum TranscriptReducer {
 
     public static func applyStreamingEvent(_ event: AgentEvent, to items: inout [TranscriptItem]) {
         apply(event: event, runID: event.runID, to: &items)
+    }
+
+    public static func applyStreamingEvents(
+        _ events: [AgentEvent],
+        to items: inout [TranscriptItem]
+    ) {
+        for event in events {
+            apply(event: event, runID: event.runID, to: &items)
+        }
     }
 
     private static func apply(event: AgentEvent, runID: String, to items: inout [TranscriptItem]) {

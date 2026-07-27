@@ -9,9 +9,12 @@ struct SessionSetupSheet: View {
     @State private var importHistory = false
     @State private var providerSessionID: String?
 
-    init(model: AppModel) {
+    init(model: AppModel, initialAgentID: AgentID) {
         self.model = model
-        _agentID = State(initialValue: model.availableAgents.first?.id ?? .claudeCode)
+        let available = model.availableAgents.map(\.id)
+        _agentID = State(initialValue: available.contains(initialAgentID)
+            ? initialAgentID
+            : available.first ?? .claudeCode)
     }
 
     var body: some View {
@@ -20,7 +23,7 @@ struct SessionSetupSheet: View {
             Form {
                 Picker("Agent", selection: $agentID) {
                     ForEach(model.availableAgents) { agent in
-                        Text(agent.id.displayName).tag(agent.id)
+                        AgentIdentityLabel(agentID: agent.id).tag(agent.id)
                     }
                 }
                 Picker("Workspace", selection: $workspaceMode) {
@@ -76,6 +79,10 @@ struct SessionSetupSheet: View {
         .onChange(of: agentID) {
             providerSessionID = nil
             Task { await model.loadProviderSessions(agent: agentID) }
+        }
+        .onChange(of: model.availableAgents.map(\.id)) { _, available in
+            guard !available.contains(agentID), let fallback = available.first else { return }
+            agentID = fallback
         }
     }
 }

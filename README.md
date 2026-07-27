@@ -97,10 +97,10 @@ scripts/build-apple-app.sh
 scripts/package-apple-adhoc-dmg.sh
 ```
 
-Pushing a version tag such as `v0.1.0` runs
-`.github/workflows/release-macos.yml` and publishes the DMG plus its SHA-256
-checksum. This distribution is not notarized, so Gatekeeper may require the
-user to approve its first launch in System Settings > Privacy & Security.
+The packaging script writes the DMG and its SHA-256 checksum to
+`dist/apple/releases/` for manual upload to a GitHub Release. This distribution
+is not notarized, so Gatekeeper may require the user to approve its first launch
+in System Settings > Privacy & Security.
 
 Local Project selection uses `NSOpenPanel` and persists an opaque
 security-scoped bookmark by Project ID. Remote Server profiles keep using the

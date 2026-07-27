@@ -148,12 +148,12 @@ struct TeamSetupSheet: View {
             if conversation == nil {
                 Picker("Leader Agent", selection: $agentID) {
                     ForEach(model.availableAgents) { agent in
-                        Text(verbatim: agent.id.displayName).tag(agent.id)
+                        AgentIdentityLabel(agentID: agent.id).tag(agent.id)
                     }
                 }
             } else if let conversation {
                 LabeledContent("Leader Agent") {
-                    Text(verbatim: conversation.agentID.displayName)
+                    AgentIdentityLabel(agentID: conversation.agentID)
                 }
             }
         }
@@ -176,7 +176,7 @@ struct TeamSetupSheet: View {
             Section("Team") {
                 LabeledContent("Title") { Text(verbatim: draft.team.title) }
                 LabeledContent("Leader Agent") {
-                    Text(verbatim: leaderConversation.agentID.displayName)
+                    AgentIdentityLabel(agentID: leaderConversation.agentID)
                 }
                 LabeledContent("Workspace") {
                     Text(draft.team.workspace == "worktree" ? "Worktree" : "Shared")
@@ -214,7 +214,7 @@ struct TeamSetupSheet: View {
         Section("Agent Budget") {
             ForEach(model.availableAgents) { agent in
                 Toggle(isOn: allowedAgentBinding(for: agent.id)) {
-                    Text(verbatim: agent.id.displayName)
+                    AgentIdentityLabel(agentID: agent.id)
                 }
                 .toggleStyle(.checkbox)
             }

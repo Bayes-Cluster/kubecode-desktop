@@ -1,23 +1,28 @@
 import SwiftUI
 import SwiftMath
+import KubecodeMarkdown
 
 #if os(macOS)
 import AppKit
 
 struct AgentMarkdownView: View {
     @Environment(\.workspaceTypography) private var typography
+    @Environment(\.markdownProjectResourceContext) private var resourceContext
     private let source: String
     private let tone: AgentMarkdownTone
     private let copyResponseSource: String?
+    private let isStreaming: Bool
 
     init(
         source: String,
         tone: AgentMarkdownTone = .primary,
-        copyResponseSource: String? = nil
+        copyResponseSource: String? = nil,
+        isStreaming: Bool = false
     ) {
         self.source = source
         self.tone = tone
         self.copyResponseSource = copyResponseSource
+        self.isStreaming = isStreaming
     }
 
     var body: some View {
@@ -25,9 +30,22 @@ struct AgentMarkdownView: View {
             source: source,
             typography: typography,
             tone: tone,
-            copyResponseSource: copyResponseSource
+            copyResponseSource: copyResponseSource,
+            isStreaming: isStreaming,
+            resourceContext: resourceContext
         )
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct MarkdownProjectResourceContextKey: EnvironmentKey {
+    static let defaultValue: MarkdownProjectResourceContext? = nil
+}
+
+extension EnvironmentValues {
+    var markdownProjectResourceContext: MarkdownProjectResourceContext? {
+        get { self[MarkdownProjectResourceContextKey.self] }
+        set { self[MarkdownProjectResourceContextKey.self] = newValue }
     }
 }
 
@@ -103,7 +121,7 @@ private struct AgentMarkdownBlockView: View {
             listView(items: items, start: start)
         case .thematicBreak:
             Divider().padding(.vertical, 4)
-        case let .table(headers, rows):
+        case let .table(_, headers, rows):
             ScrollView(.horizontal) {
                 Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
                     if !headers.isEmpty {
@@ -118,6 +136,11 @@ private struct AgentMarkdownBlockView: View {
                         .strokeBorder(.separator.opacity(0.55), lineWidth: 0.5)
                 }
             }
+        case let .rawHTML(value):
+            Text(value)
+                .font(.system(.callout, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
         }
     }
 
@@ -136,22 +159,30 @@ private struct AgentMarkdownBlockView: View {
     }
 
     private func listView(
-        items: [[AgentMarkdownBlock]],
+        items: [AgentMarkdownListItem],
         start: Int?
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(Array(items.enumerated()), id: \.offset) { offset, item in
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(verbatim: start.map { "\($0 + offset)." } ?? "•")
+                    Text(verbatim: listMarker(item.checkbox, start: start, offset: offset))
                         .font(typography.swiftUIFont(for: .body))
                         .foregroundStyle(.secondary)
                         .frame(minWidth: 18, alignment: .trailing)
                     AgentMarkdownBlocksView(
-                        blocks: item,
+                        blocks: item.blocks,
                         foregroundStyle: foregroundStyle
                     )
                 }
             }
+        }
+    }
+
+    private func listMarker(_ checkbox: MarkdownCheckbox?, start: Int?, offset: Int) -> String {
+        switch checkbox {
+        case .checked?: "☑"
+        case .unchecked?: "☐"
+        case nil: start.map { "\($0 + offset)." } ?? "•"
         }
     }
 

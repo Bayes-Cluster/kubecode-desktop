@@ -323,7 +323,8 @@ private struct AgentDiagnosticsSettings: View {
                 ForEach(agents) { agent in
                     VStack(alignment: .leading, spacing: 7) {
                         HStack {
-                            Text(agent.id.displayName).font(.headline)
+                            AgentIdentityLabel(agentID: agent.id, iconSize: 18)
+                                .font(.headline)
                             Spacer()
                             Text(agent.readiness ?? (agent.available ? "ready" : "unavailable"))
                                 .foregroundStyle(agent.available ? .green : .red)

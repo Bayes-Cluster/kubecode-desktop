@@ -41,29 +41,73 @@ stable. Window-scoped Navigator filter state lives in
 Workspace sidebar children must not install titlebar accessory controllers,
 draw titlebar-safe-area chrome, or create a second split shell. AppKit owns
 traffic-light avoidance, native toolbar placement, and sidebar collapse.
+The leading column is one seamless stack: Sessions, the current Session Plan,
+Changes, Files, and the fixed Runtime footer. Its lower content receives an
+explicit bounded height and cannot overflow into the Session list.
 
 ## Live presentation boundary
 
-`RuntimeClient` parses SSE framing away from the main actor. `AppModel` applies
-each accepted delta to the observable transcript on the main actor and yields
-between buffered events. Native TextKit views own selection, Markdown, code,
-math layout, and intrinsic-size invalidation. Scroll following is presentation
-state: only real user navigation disables it, and no cursor state is written to
-the Runtime.
+`RuntimeClient` parses SSE framing away from the main actor. An actor-isolated
+dispatch bridge combines adjacent text and thinking deltas, flushes semantic
+events immediately, and publishes one transcript batch every 33 to 50
+milliseconds. `KubecodeMacUI` owns one persistent AppKit collection
+viewport, virtualization, explicit row frames, width reflow, and scrolling.
+Native TextKit views own selection, Markdown, code, and math drawing, but expose
+no intrinsic row size and never invalidate a collection item during document
+application. Scroll following is window presentation state: only real user
+navigation disables it, and neither pixel offsets nor cursor state are written
+to `AppModel` or the Runtime.
 
-Each native message view caches its parsed Markdown and rendered attributed
-document in its `NSViewRepresentable` coordinator. Viewport changes and SwiftUI
-layout passes must reuse that document; only a changed source, typography, or
-tone may rebuild or reapply it. Apply decisions use that Kubecode-owned input
-version, never a deep comparison with `NSTextView`'s attributed content because
-TextKit may add internal attributes after assignment. Read-only Agent output
-also disables spelling correction, text replacement, and smart punctuation.
-TextKit measurement synchronizes the proposed width only
-when the width actually changes and caches the resulting height. It must not
-mutate the native frame on every measurement, because that creates a
-scroll-layout feedback loop for long restored Sessions. Rendering acceptance
-therefore covers cache reuse, no-op viewport updates, and non-overlapping native
-message frames.
+The complete floating composer is measured as the transcript's bottom
+obstruction. Maximum scroll origin, near-tail distance, and anchor clamping use
+one obstruction-aware geometry model, so the final visible row always clears
+the composer while user-controlled scroll positions remain stable.
+
+`TranscriptReducer` preserves stable provider message and tool identities.
+`TranscriptPresentation` groups each run into one run presentation: user
+message, collapsed Working activity, one fixed output, and explicit failure
+rows. Working contains only thinking and tools. The latest active Agent text
+refreshes the stable `run-{runID}-output` row as a selectable 220-character,
+three-line preview; terminal success upgrades that row to the complete final
+answer and unsuccessful termination upgrades it to complete Partial output.
+Older updates remain in reducer and provider history but do not accumulate as
+presentation rows. The macOS projection gives every visible row an independent
+stable collection identity and keeps output directly below Working even when
+details expand. This layer is shared by streaming, restored history, pagination,
+and revision snapshots; it does not rewrite or persist provider events.
+
+`KubecodeMarkdown` owns the UI-independent CommonMark/GFM AST and the code-aware
+LaTeX scanner. Active output remains bounded selectable plain text and performs
+no rich parse, image load, or math typesetting per delta. Completion parses once
+off the main actor and atomically applies one selectable TextKit document.
+CommonMark blocks, GFM tables/task lists, syntax-highlighted fenced code, and
+SwiftMath attachments share that document. Raw HTML remains visible literal
+source and is never executed.
+
+Each native message coordinator caches its final AST projection and rendered
+attributed document by source, typography, tone, and Project resource identity.
+Credential-free HTTPS images use the bounded ephemeral image loader; validated
+relative image paths use `RuntimeClient.readAsset` with the current Project ID.
+Viewport changes reuse the document and scalar height cache instead of parsing.
+The AppKit collection caches scalar heights by stable item ID, semantic content
+revision, and rounded width. It coalesces continuous sidebar width changes to
+one layout commit per display frame, settles the final width after 80
+milliseconds, and preserves the first visible item and offset. Read-only Agent
+output disables spelling correction, text replacement, and smart punctuation.
+Stable insertions, deletions, and row reloads use one nonanimated collection
+batch. Transactions that combine structural and content changes, plus true
+reordering, use a full reload to avoid mixing old and new index paths. Collection completion
+is the only point for anchor restoration or tail following, and streaming never
+forces document-wide synchronous layout.
+Rendering acceptance interleaves sidebar resize, live scroll, and streaming
+growth rather than testing those operations sequentially.
+
+Each scene creates one `WindowWorkspaceModel`. It owns an independent
+`AppModel` plus stable Navigation, Session, Project, Team, Terminal, and window
+presentation boundaries. The Session boundary owns high-frequency composer,
+transcript-follow, and autosave state, so these updates do not recreate the
+window shell. Windows share only application-scoped connection management and
+the corresponding `ServerSession` transport/projections.
 
 ## Terminal ownership
 

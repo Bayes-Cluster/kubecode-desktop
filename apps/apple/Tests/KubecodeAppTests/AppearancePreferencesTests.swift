@@ -40,7 +40,7 @@ struct AppearancePreferencesTests {
         #expect(typography.displayFontName == WorkspaceTypography.systemFontName)
     }
 
-    @Test func native_composer_and_math_renderer_follow_workspace_typography() throws {
+    @Test func native_composer_and_math_renderer_follow_workspace_typography() async throws {
         var text = "Use native text"
         var height = ComposerHeightCalculator.minimumHeight
         let typography = WorkspaceTypography(fontName: "Helvetica Neue", pointSize: 18)
@@ -67,13 +67,17 @@ struct AppearancePreferencesTests {
         defer { window.orderOut(nil) }
         window.layoutIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        try await Task.sleep(for: .milliseconds(100))
 
         let composer = try #require(descendant(of: ComposerTextView.self, in: controller.view))
         let markdown = try #require(descendant(
             of: NativeAgentMarkdownTextView.self,
             in: controller.view
         ))
+        let renderDeadline = Date().addingTimeInterval(1)
+        while markdown.renderedMathPointSizes.isEmpty, Date() < renderDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         #expect(composer.font?.familyName == "Helvetica Neue")
         #expect(composer.font?.pointSize == 18)
         #expect(markdown.renderedMathPointSizes == [18])

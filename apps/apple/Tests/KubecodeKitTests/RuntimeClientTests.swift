@@ -87,6 +87,29 @@ struct RuntimeClientTests {
         #expect(projects == [Project(id: "project-1", name: "Demo", workspacesEnabled: false)])
     }
 
+    @Test func project_assets_preserve_binary_data_and_relative_path_scope() async throws {
+        MockURLProtocol.handler = { request in
+            #expect(request.url?.path == "/api/v1/projects/project-1/asset")
+            #expect(request.url?.query == "path=docs/diagram%20one.png")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
+            return (
+                HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "image/png"]
+                )!,
+                Data([0x89, 0x50, 0x4e, 0x47])
+            )
+        }
+
+        let data = try await client().readAsset(
+            projectID: "project-1",
+            path: "docs/diagram one.png"
+        )
+        #expect(data == Data([0x89, 0x50, 0x4e, 0x47]))
+    }
+
     @Test func project_path_authorization_is_scoped_to_an_existing_project() async throws {
         MockURLProtocol.handler = { request in
             #expect(request.url?.path == "/api/v1/projects/project-1/authorize")

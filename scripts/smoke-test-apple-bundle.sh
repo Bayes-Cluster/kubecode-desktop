@@ -63,6 +63,16 @@ if [[ ! -f "${resources_root}/THIRD_PARTY_NOTICES.md" ]]; then
   echo "Apple bundle is missing third-party notices" >&2
   exit 1
 fi
+for notice in \
+  SwiftMath.txt \
+  SwiftMarkdown-LICENSE.txt \
+  SwiftMarkdown-NOTICE.txt \
+  swift-cmark-COPYING.txt; do
+  if [[ ! -s "${resources_root}/Licenses/${notice}" ]]; then
+    echo "Apple bundle is missing license notice: ${notice}" >&2
+    exit 1
+  fi
+done
 if find "${runtime_root}/shared/adapter-runtime/node_modules" \
   \( -name '*claude-agent-sdk-darwin-*' -o -name '*codex-darwin-*' \) \
   -print -quit | grep -q .; then

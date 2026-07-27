@@ -180,6 +180,12 @@ cp "${runtime_repo}/packaging/THIRD_PARTY_NOTICES.md" \
   "${app_root}/Contents/Resources/THIRD_PARTY_NOTICES.md"
 cp "${apple_root}/Vendor/SwiftMath/LICENSE" \
   "${app_root}/Contents/Resources/Licenses/SwiftMath.txt"
+cp "${apple_root}/Vendor/SwiftMarkdown/LICENSE.txt" \
+  "${app_root}/Contents/Resources/Licenses/SwiftMarkdown-LICENSE.txt"
+cp "${apple_root}/Vendor/SwiftMarkdown/NOTICE.txt" \
+  "${app_root}/Contents/Resources/Licenses/SwiftMarkdown-NOTICE.txt"
+cp "${apple_root}/Vendor/swift-cmark/COPYING" \
+  "${app_root}/Contents/Resources/Licenses/swift-cmark-COPYING.txt"
 chmod +x \
   "${app_root}/Contents/MacOS/Kubecode" \
   "${app_root}/Contents/Resources/Runtime/arm64/kubecode-server" \

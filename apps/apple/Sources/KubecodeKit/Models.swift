@@ -368,6 +368,20 @@ public struct AgentEvent: Codable, Identifiable, Hashable, Sendable {
     public let payload: [String: JSONValue]
     public let createdAt: String
 
+    public init(
+        runID: String,
+        sequence: Int,
+        kind: String,
+        payload: [String: JSONValue],
+        createdAt: String
+    ) {
+        self.runID = runID
+        self.sequence = sequence
+        self.kind = kind
+        self.payload = payload
+        self.createdAt = createdAt
+    }
+
     enum CodingKeys: String, CodingKey {
         case kind, payload
         case runID = "run_id"

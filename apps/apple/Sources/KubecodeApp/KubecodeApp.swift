@@ -4,11 +4,11 @@ import KubecodeKit
 import KubecodeMacRuntime
 
 private struct WorkspaceModelKey: FocusedValueKey {
-    typealias Value = AppModel
+    typealias Value = WindowWorkspaceModel
 }
 
 extension FocusedValues {
-    var workspaceModel: AppModel? {
+    var workspaceModel: WindowWorkspaceModel? {
         get { self[WorkspaceModelKey.self] }
         set { self[WorkspaceModelKey.self] = newValue }
     }
@@ -76,7 +76,7 @@ enum WorkspaceKeyboardShortcuts {
 }
 
 private struct WorkspaceWindow: View {
-    @State private var model: AppModel
+    @State private var model: WindowWorkspaceModel
     @SceneStorage("workspace.persistence-id") private var persistenceID = UUID().uuidString
     @SceneStorage("workspace.inspector-presented") private var inspectorPresented = true
     @AppStorage("appearance.mode") private var appearanceMode = "system"
@@ -84,34 +84,34 @@ private struct WorkspaceWindow: View {
     @AppStorage("appearance.uiSize") private var uiSize = WorkspaceTypography.defaultPointSize
 
     init(connections: MacConnectionManager) {
-        _model = State(initialValue: AppModel(
+        _model = State(initialValue: WindowWorkspaceModel(
             connections: connections,
             notificationCoordinator: .shared
         ))
     }
 
     var body: some View {
-        ContentView(model: model)
+        ContentView(model: model.workspace, sessionWorkspace: model.session)
             .frame(minWidth: 1040, minHeight: 680)
             .tint(Color(red: 79 / 255, green: 99 / 255, blue: 245 / 255))
-            .background(WorkspaceWindowCloseBridge(model: model).frame(width: 0, height: 0))
+            .background(WorkspaceWindowCloseBridge(model: model.workspace).frame(width: 0, height: 0))
             .focusedSceneValue(\.workspaceModel, model)
             .preferredColorScheme(preferredColorScheme)
             .workspaceTypography(WorkspaceTypography(fontName: uiFont, pointSize: uiSize))
             .task {
-                model.isInspectorPresented = inspectorPresented
-                model.configureWindowPersistence(id: persistenceID)
-                await model.start()
+                model.workspace.isInspectorPresented = inspectorPresented
+                model.workspace.configureWindowPersistence(id: persistenceID)
+                await model.workspace.start()
             }
-            .onChange(of: model.isInspectorPresented) { _, presented in
+            .onChange(of: model.workspace.isInspectorPresented) { _, presented in
                 inspectorPresented = presented
             }
             .onReceive(NotificationCenter.default.publisher(
                 for: SessionDraftStore.persistencePreferenceDidChange
             )) { _ in
-                model.handleDraftPersistencePreferenceChanged()
+                model.workspace.handleDraftPersistencePreferenceChanged()
             }
-            .onDisappear { model.disconnectWindow() }
+            .onDisappear { model.disconnect() }
     }
 
     private var preferredColorScheme: ColorScheme? {
@@ -126,87 +126,89 @@ private struct WorkspaceWindow: View {
 private struct WorkspaceCommands: Commands {
     @FocusedValue(\.workspaceModel) private var model
 
+    private var workspace: AppModel? { model?.workspace }
+
     var body: some Commands {
         CommandGroup(after: .newItem) {
-            Button("Add Project…") { model?.presentProjectRegistration() }
+            Button("Add Project…") { workspace?.presentProjectRegistration() }
                 .keyboardShortcut(
                     WorkspaceKeyboardShortcuts.addProject.keyEquivalent,
                     modifiers: WorkspaceKeyboardShortcuts.addProject.modifiers
                 )
-                .disabled(model?.isReady != true)
-            Button("New Session") { model?.isSessionSetupPresented = true }
+                .disabled(workspace?.isReady != true)
+            Button("New Session") { workspace?.presentSessionSetup() }
                 .keyboardShortcut(
                     WorkspaceKeyboardShortcuts.newSession.keyEquivalent,
                     modifiers: WorkspaceKeyboardShortcuts.newSession.modifiers
                 )
-                .disabled(model?.selectedProject == nil)
-            Button("New Team", systemImage: "person.3") { model?.isTeamSetupPresented = true }
-                .disabled(model?.canCreateTeam != true)
-            Button("Quick Open") { model?.isQuickOpenPresented = true }
+                .disabled(workspace?.selectedProject == nil)
+            Button("New Team", systemImage: "person.3") { workspace?.isTeamSetupPresented = true }
+                .disabled(workspace?.canCreateTeam != true)
+            Button("Quick Open") { workspace?.isQuickOpenPresented = true }
                 .keyboardShortcut(
                     WorkspaceKeyboardShortcuts.quickOpen.keyEquivalent,
                     modifiers: WorkspaceKeyboardShortcuts.quickOpen.modifiers
                 )
-                .disabled(model?.canUseSelectedProjectFiles != true)
+                .disabled(workspace?.canUseSelectedProjectFiles != true)
         }
         CommandGroup(replacing: .saveItem) {
-            Button("Save") { model?.saveDocument() }
+            Button("Save") { workspace?.saveDocument() }
                 .keyboardShortcut(
                     WorkspaceKeyboardShortcuts.save.keyEquivalent,
                     modifiers: WorkspaceKeyboardShortcuts.save.modifiers
                 )
-                .disabled(model?.canSaveActiveDocument != true)
+                .disabled(workspace?.canSaveActiveDocument != true)
         }
         CommandGroup(after: .textEditing) {
-            Button("Find", systemImage: "magnifyingglass") { model?.requestFind() }
+            Button("Find", systemImage: "magnifyingglass") { workspace?.requestFind() }
                 .keyboardShortcut(
                     WorkspaceKeyboardShortcuts.find.keyEquivalent,
                     modifiers: WorkspaceKeyboardShortcuts.find.modifiers
                 )
-                .disabled(model?.activeDocument == nil)
+                .disabled(workspace?.activeDocument == nil)
             Button("Find and Replace", systemImage: "arrow.triangle.2.circlepath") {
-                model?.requestFindAndReplace()
+                workspace?.requestFindAndReplace()
             }
             .keyboardShortcut(
                 WorkspaceKeyboardShortcuts.findAndReplace.keyEquivalent,
                 modifiers: WorkspaceKeyboardShortcuts.findAndReplace.modifiers
             )
-            .disabled(model?.activeDocument == nil)
+            .disabled(workspace?.activeDocument == nil)
         }
         CommandMenu("Runtime") {
             Button("Refresh Workspace") {
-                guard let model else { return }
-                Task { await model.refresh() }
+                guard let workspace else { return }
+                Task { await workspace.refresh() }
             }
             .keyboardShortcut(
                 WorkspaceKeyboardShortcuts.refresh.keyEquivalent,
                 modifiers: WorkspaceKeyboardShortcuts.refresh.modifiers
             )
-            .disabled(model?.isReady != true)
-            Button("Show Runtime Log") { model?.openRuntimeLog() }
+            .disabled(workspace?.isReady != true)
+            Button("Show Runtime Log") { workspace?.openRuntimeLog() }
         }
         CommandGroup(after: .sidebar) {
             Button("Search Sessions", systemImage: "magnifyingglass") {
-                model?.isNavigationSearchPresented = true
+                workspace?.isNavigationSearchPresented = true
             }
             .keyboardShortcut(
                 WorkspaceKeyboardShortcuts.searchSessions.keyEquivalent,
                 modifiers: WorkspaceKeyboardShortcuts.searchSessions.modifiers
             )
-            .disabled(model?.selectedProject == nil)
+            .disabled(workspace?.selectedProject == nil)
             Button(terminalPanelCommandTitle, systemImage: "rectangle.bottomhalf.inset.filled") {
-                model?.toggleTerminalPanel()
+                workspace?.toggleTerminalPanel()
             }
             .keyboardShortcut(
                 WorkspaceKeyboardShortcuts.terminalPanel.keyEquivalent,
                 modifiers: WorkspaceKeyboardShortcuts.terminalPanel.modifiers
             )
-            .disabled(model?.canToggleTerminalPanel != true)
+            .disabled(workspace?.canToggleTerminalPanel != true)
         }
     }
 
     private var terminalPanelCommandTitle: LocalizedStringKey {
-        model?.isTerminalPanelPresented == true ? "Hide Terminal Panel" : "Show Terminal Panel"
+        workspace?.isTerminalPanelPresented == true ? "Hide Terminal Panel" : "Show Terminal Panel"
     }
 
 }

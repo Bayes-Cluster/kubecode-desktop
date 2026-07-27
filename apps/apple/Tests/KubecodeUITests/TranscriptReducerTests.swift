@@ -112,4 +112,181 @@ struct TranscriptReducerTests {
         #expect(historyItems.filter { $0.role == .status }.count == 1)
         #expect(historyItems.last?.id == "run-r-status")
     }
+
+    @Test func repeated_thinking_tools_and_updates_form_one_run_presentation() {
+        let items = [
+            TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+            TranscriptItem(id: "thought-1", role: .thinking, text: "Plan", runID: "run-1"),
+            TranscriptItem(id: "tool-1", role: .tool, text: "Read", runID: "run-1"),
+            TranscriptItem(id: "update", role: .agent, text: "Found the entry point", runID: "run-1"),
+            TranscriptItem(id: "thought-2", role: .thinking, text: "Verify", runID: "run-1"),
+            TranscriptItem(id: "tool-2", role: .tool, text: "Test", runID: "run-1"),
+        ]
+
+        let entries = TranscriptPresentation.entries(items: items, activeRunID: "run-1")
+
+        #expect(entries.map(\.id) == ["run-run-1-presentation"])
+        guard case let .run(presentation) = entries[0],
+              let activity = presentation.activity,
+              let output = presentation.output
+        else {
+            Issue.record("Expected one run-level presentation")
+            return
+        }
+        #expect(presentation.userItems.map(\.id) == ["user"])
+        #expect(activity.isActive)
+        #expect(activity.items.map(\.id) == ["thought-1", "tool-1", "thought-2", "tool-2"])
+        #expect(activity.stepCount == 4)
+        #expect(activity.toolCount == 2)
+        #expect(!activity.defaultExpanded)
+        #expect(output.id == "run-run-1-output")
+        #expect(output.phase == .update)
+        #expect(output.text == "Found the entry point")
+    }
+
+    @Test func completed_run_promotes_only_the_last_agent_text_to_final_output() {
+        let items = [
+            TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+            TranscriptItem(id: "update", role: .agent, text: "Reading files", runID: "run-1"),
+            TranscriptItem(id: "tool", role: .tool, text: "Read", runID: "run-1"),
+            TranscriptItem(id: "answer", role: .agent, text: "Final answer", runID: "run-1"),
+            TranscriptItem(
+                id: "status",
+                role: .status,
+                text: "completed",
+                runID: "run-1",
+                status: "completed"
+            ),
+        ]
+
+        let entries = TranscriptPresentation.entries(items: items, activeRunID: nil)
+
+        #expect(entries.map(\.id) == ["run-run-1-presentation"])
+        guard case let .run(presentation) = entries[0],
+              let activity = presentation.activity,
+              let output = presentation.output
+        else {
+            Issue.record("Expected activity followed by final output")
+            return
+        }
+        #expect(activity.items.map(\.id) == ["tool"])
+        #expect(!activity.defaultExpanded)
+        #expect(output.id == "run-run-1-output")
+        #expect(output.phase == .final)
+        #expect(output.text == "Final answer")
+    }
+
+    @Test func failed_run_surfaces_partial_output_outside_collapsed_activity() {
+        let items = [
+            TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+            TranscriptItem(id: "partial", role: .agent, text: "Partial", runID: "run-1"),
+            TranscriptItem(id: "tool", role: .tool, text: "Shell", runID: "run-1", status: "failed"),
+            TranscriptItem(id: "error", role: .system, text: "Command failed", runID: "run-1"),
+            TranscriptItem(
+                id: "status",
+                role: .status,
+                text: "failed",
+                runID: "run-1",
+                status: "failed"
+            ),
+        ]
+
+        let entries = TranscriptPresentation.entries(items: items, activeRunID: nil)
+
+        #expect(entries.map(\.id) == ["run-run-1-presentation"])
+        guard case let .run(presentation) = entries[0],
+              let activity = presentation.activity,
+              let output = presentation.output
+        else {
+            Issue.record("Expected failed run presentation")
+            return
+        }
+        #expect(activity.items.map(\.id) == ["tool"])
+        #expect(!activity.defaultExpanded)
+        #expect(activity.status == "failed")
+        #expect(output.id == "run-run-1-output")
+        #expect(output.phase == .partial)
+        #expect(output.text == "Partial")
+        #expect(presentation.trailingItems.map(\.id) == ["error", "status"])
+    }
+
+    @Test func activity_recent_window_is_bounded_without_discarding_steps() {
+        let activity = TranscriptRunActivity(
+            runID: "run-1",
+            items: (1...12).map {
+                TranscriptItem(id: "step-\($0)", role: .thinking, text: "Step \($0)", runID: "run-1")
+            },
+            isActive: false,
+            status: "completed"
+        )
+
+        #expect(activity.recentItems(limit: 8).map(\.id) == (5...12).map { "step-\($0)" })
+        #expect(activity.hiddenItemCount(limit: 8) == 4)
+        #expect(activity.items.count == 12)
+    }
+
+    @Test func activity_identity_survives_completion_and_run_boundaries_remain_independent() {
+        let activeItems = [
+            TranscriptItem(id: "run-1-user", role: .user, text: "First", runID: "run-1"),
+            TranscriptItem(id: "run-1-thought", role: .thinking, text: "Think", runID: "run-1"),
+        ]
+        let completedItems = activeItems + [
+            TranscriptItem(id: "run-1-answer", role: .agent, text: "Done", runID: "run-1"),
+            TranscriptItem(
+                id: "run-1-status",
+                role: .status,
+                text: "completed",
+                runID: "run-1",
+                status: "completed"
+            ),
+            TranscriptItem(id: "run-2-user", role: .user, text: "Second", runID: "run-2"),
+            TranscriptItem(id: "run-2-tool", role: .tool, text: "Shell", runID: "run-2"),
+            TranscriptItem(id: "notice", role: .system, text: "Unscoped notice"),
+        ]
+
+        let active = TranscriptPresentation.entries(items: activeItems, activeRunID: "run-1")
+        let completed = TranscriptPresentation.entries(items: completedItems, activeRunID: "run-2")
+
+        #expect(active.map(\.id) == ["run-run-1-presentation"])
+        #expect(completed.map(\.id) == [
+            "run-run-1-presentation", "run-run-2-presentation", "notice",
+        ])
+
+        guard case let .run(activeRun) = active[0],
+              case let .run(completedRun) = completed[0],
+              let completedOutput = completedRun.output
+        else {
+            Issue.record("Expected stable run presentations")
+            return
+        }
+        #expect(activeRun.activity?.id == completedRun.activity?.id)
+        #expect(completedOutput.id == "run-run-1-output")
+        #expect(completedOutput.phase == .final)
+    }
+
+    @Test func latest_update_reuses_one_bounded_output_slot() {
+        let longUpdate = String(repeating: "界", count: 260)
+        let initial = TranscriptPresentation.entries(items: [
+            TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+            TranscriptItem(id: "update-1", role: .agent, text: "First update", runID: "run-1"),
+        ], activeRunID: "run-1")
+        let refreshed = TranscriptPresentation.entries(items: [
+            TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+            TranscriptItem(id: "update-1", role: .agent, text: "First update", runID: "run-1"),
+            TranscriptItem(id: "update-2", role: .agent, text: longUpdate, runID: "run-1"),
+        ], activeRunID: "run-1")
+
+        guard case let .run(initialRun) = initial[0],
+              case let .run(refreshedRun) = refreshed[0],
+              let initialOutput = initialRun.output,
+              let refreshedOutput = refreshedRun.output
+        else {
+            Issue.record("Expected active output slots")
+            return
+        }
+        #expect(initialOutput.id == refreshedOutput.id)
+        #expect(refreshedOutput.sourceItemID == "update-2")
+        #expect(refreshedOutput.text.count == TranscriptRunOutput.activePreviewLimit)
+        #expect(refreshedOutput.text == String(longUpdate.prefix(TranscriptRunOutput.activePreviewLimit)))
+    }
 }

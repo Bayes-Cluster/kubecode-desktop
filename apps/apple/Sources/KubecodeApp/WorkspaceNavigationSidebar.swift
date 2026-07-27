@@ -397,7 +397,7 @@ struct WorkspaceNavigationSidebar: View {
     @ViewBuilder
     private var newSessionContextMenu: some View {
         Button("New Session...", systemImage: "plus.bubble") {
-            model.isSessionSetupPresented = true
+            model.presentSessionSetup()
         }
         .workspaceAccessibility(.newSession)
         .disabled(model.selectedProject == nil || model.availableAgents.isEmpty)
@@ -442,7 +442,7 @@ struct WorkspaceNavigationSidebar: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(conversation.title).lineLimit(1)
                 HStack(spacing: 5) {
-                    Text(conversation.agentID.displayName)
+                    AgentIdentityLabel(agentID: conversation.agentID, iconSize: 11)
                     if let relationship = relationshipLabel(conversation.relationship) {
                         Text(relationship)
                     }

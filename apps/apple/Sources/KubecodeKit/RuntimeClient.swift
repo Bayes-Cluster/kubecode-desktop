@@ -421,6 +421,10 @@ public struct RuntimeClient: Sendable {
         try await request(path: projectPath(projectID) + "/file?path=\(queryEscaped(path))")
     }
 
+    public func readAsset(projectID: String, path: String) async throws -> Data {
+        try await requestData(path: projectPath(projectID) + "/asset?path=\(queryEscaped(path))")
+    }
+
     public func writeFile(projectID: String, document: TextDocument) async throws -> TextDocument {
         try await request(
             path: projectPath(projectID) + "/file?path=\(queryEscaped(document.path))",
@@ -714,6 +718,15 @@ public struct RuntimeClient: Sendable {
         let (data, response) = try await session.data(for: request)
         try validate(response: response, data: data)
         return try decoder.decode(T.self, from: data)
+    }
+
+    private func requestData(path: String) async throws -> Data {
+        var request = try makeRequest(path: path)
+        request.httpMethod = "GET"
+        request.setValue("image/*", forHTTPHeaderField: "Accept")
+        let (data, response) = try await session.data(for: request)
+        try validate(response: response, data: data)
+        return data
     }
 
     private func request<T: Decodable, Body: Encodable>(

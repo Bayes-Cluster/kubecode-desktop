@@ -40,8 +40,9 @@ struct AgentMarkdownDocumentTests {
             return false
         })
         #expect(document.blocks.contains { block in
-            if case let .table(headers, rows) = block {
-                return headers.count == 2 && rows.count == 1 && rows[0].count == 2
+            if case let .table(alignments, headers, rows) = block {
+                return alignments == [.unspecified, .right]
+                    && headers.count == 2 && rows.count == 1 && rows[0].count == 2
             }
             return false
         })
@@ -170,5 +171,27 @@ struct AgentMarkdownDocumentTests {
         #expect(runs.contains { $0.text == "removed" && $0.traits.contains(.strikethrough) })
         #expect(runs.contains { $0.text == "code" && $0.traits.contains(.code) })
         #expect(runs.contains { $0.text == "Swift" && $0.destination?.absoluteString == "https://swift.org" })
+    }
+
+    @Test func images_are_deduplicated_and_scoped_to_https_or_project_relative_paths() {
+        let document = AgentMarkdownDocument(source: """
+        ![local](docs/diagram.png)
+        ![same local](docs/diagram.png)
+        ![remote](https://example.com/result.png)
+        ![unsafe](../secret.png)
+        ![insecure](http://example.com/result.png)
+        """)
+
+        #expect(document.imageLoads.count == 2)
+        #expect(document.imageLoads.contains {
+            $0.source == "docs/diagram.png"
+                && $0.projectPath == "docs/diagram.png"
+                && $0.remoteURL == nil
+        })
+        #expect(document.imageLoads.contains {
+            $0.source == "https://example.com/result.png"
+                && $0.remoteURL?.host == "example.com"
+                && $0.projectPath == nil
+        })
     }
 }

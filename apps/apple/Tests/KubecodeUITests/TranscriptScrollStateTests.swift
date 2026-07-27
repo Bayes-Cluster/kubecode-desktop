@@ -42,4 +42,18 @@ struct TranscriptScrollStateTests {
         #expect(state.followsOutput)
         #expect(!state.hasUnseenOutput)
     }
+
+    @Test @MainActor func reference_scoped_controller_preserves_scroll_behavior() {
+        let controller = TranscriptScrollController()
+        let sameController = controller
+
+        controller.viewportDidChange(isNearBottom: false)
+        #expect(!sameController.outputDidChange())
+        #expect(!sameController.followsOutput)
+        #expect(sameController.hasUnseenOutput)
+
+        sameController.resumeFollowing()
+        #expect(controller.followsOutput)
+        #expect(!controller.hasUnseenOutput)
+    }
 }
