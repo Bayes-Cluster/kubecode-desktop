@@ -67,33 +67,49 @@ the composer while user-controlled scroll positions remain stable.
 `TranscriptPresentation` groups each run into one run presentation: user
 message, collapsed Working activity, one fixed output, and explicit failure
 rows. Working contains only thinking and tools. The latest active Agent text
-refreshes the stable `run-{runID}-output` row as a selectable 220-character,
-three-line preview; terminal success upgrades that row to the complete final
-answer and unsuccessful termination upgrades it to complete Partial output.
-Older updates remain in reducer and provider history but do not accumulate as
-presentation rows. The macOS projection gives every visible row an independent
-stable collection identity and keeps output directly below Working even when
-details expand. This layer is shared by streaming, restored history, pagination,
-and revision snapshots; it does not rewrite or persist provider events.
+refreshes the stable `run-{runID}-output` row with the complete provider source,
+without trimming, normalization, a character cap, or a line preview. Update,
+final, and partial phases all use one `AgentMarkdownView` and expose the exact
+source to Copy Response. Older updates remain in reducer and provider history
+but do not accumulate as presentation rows. The macOS projection gives every
+visible row an independent stable collection identity and keeps output directly
+below Working even when details expand. This layer is shared by streaming,
+restored history, pagination, and revision snapshots; it does not rewrite or
+persist provider events.
 
 `KubecodeMarkdown` owns the UI-independent CommonMark/GFM AST and the code-aware
-LaTeX scanner. Active output remains bounded selectable plain text and performs
-no rich parse, image load, or math typesetting per delta. Completion parses once
-off the main actor and atomically applies one selectable TextKit document.
-CommonMark blocks, GFM tables/task lists, syntax-highlighted fenced code, and
-SwiftMath attachments share that document. Raw HTML remains visible literal
-source and is never executed.
+LaTeX scanner. A row-scoped prepared-render session accepts complete source
+snapshots for every phase, coalesces pending work, rejects stale generations,
+and parses plus reconciles `StreamingMarkdownDocument` snapshots off the main
+actor. `AgentMarkdownRenderCommit` preparation, including attributed AppKit
+artifacts, mutable session publication, `NSTextStorage` application, and
+measurement consumption remain MainActor-bound. Stable Markdown block identity
+lets the native selectable TextKit view retain a proven prefix and replace only
+its changed suffix. CommonMark blocks, GFM tables/task lists,
+syntax-highlighted fenced code, and SwiftMath attachments share that document.
+Raw HTML remains visible literal source and is never executed.
 
-Each native message coordinator caches its final AST projection and rendered
-attributed document by source, typography, tone, and Project resource identity.
+Run-output content revision is based only on the stable output ID and exact
+visible source. Phase and provider source metadata do not change visible or copy
+content, so an identical-source update-to-final handoff produces no collection
+reload and retains the native view, text storage, render session, content
+version, and prepared commit. Every non-output entry retains its existing
+complete-entry revision. A changed source still changes output revision and may
+recreate the collection host; persistent host reconfiguration across different
+streaming snapshots remains the explicit scope of Issue #7.
+
+Each native message coordinator applies prepared render commits keyed by source,
+typography, tone, and Project resource identity. `sizeThatFits` consumes only a
+matching prepared commit and never synchronously parses Markdown.
 Credential-free HTTPS images use the bounded ephemeral image loader; validated
 relative image paths use `RuntimeClient.readAsset` with the current Project ID.
-Viewport changes reuse the document and scalar height cache instead of parsing.
-The AppKit collection caches scalar heights by stable item ID, semantic content
-revision, and rounded width. It coalesces continuous sidebar width changes to
-one layout commit per display frame, settles the final width after 80
-milliseconds, and preserves the first visible item and offset. Read-only Agent
-output disables spelling correction, text replacement, and smart punctuation.
+The current collection still caches scalar row heights independently from
+asynchronously prepared and attachment-settled render commits. Making visible
+content and height one authoritative versioned commit remains the explicit
+scope of Issue #6; this layer does not claim authoritative height, attachment
+settlement height, follow-tail stability, anchor stability, or atomic geometry.
+Read-only Agent output disables spelling correction, text replacement, and
+smart punctuation.
 Stable insertions, deletions, and row reloads use one nonanimated collection
 batch. Transactions that combine structural and content changes, plus true
 reordering, use a full reload to avoid mixing old and new index paths. Collection completion

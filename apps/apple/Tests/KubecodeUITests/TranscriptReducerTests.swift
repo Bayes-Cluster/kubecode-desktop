@@ -264,8 +264,8 @@ struct TranscriptReducerTests {
         #expect(completedOutput.phase == .final)
     }
 
-    @Test func latest_update_reuses_one_bounded_output_slot() {
-        let longUpdate = String(repeating: "界", count: 260)
+    @Test func active_output_preserves_complete_exact_source_and_stable_output_id() {
+        let exactSource = "  # 进度\n" + String(repeating: "界🙂", count: 140) + "\n\n  tail  \n"
         let initial = TranscriptPresentation.entries(items: [
             TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
             TranscriptItem(id: "update-1", role: .agent, text: "First update", runID: "run-1"),
@@ -273,20 +273,96 @@ struct TranscriptReducerTests {
         let refreshed = TranscriptPresentation.entries(items: [
             TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
             TranscriptItem(id: "update-1", role: .agent, text: "First update", runID: "run-1"),
-            TranscriptItem(id: "update-2", role: .agent, text: longUpdate, runID: "run-1"),
+            TranscriptItem(
+                id: "update-2",
+                role: .agent,
+                text: exactSource,
+                runID: "run-1",
+                messageID: "message-2"
+            ),
         ], activeRunID: "run-1")
+        let completed = TranscriptPresentation.entries(items: [
+            TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+            TranscriptItem(
+                id: "update-2",
+                role: .agent,
+                text: exactSource,
+                runID: "run-1",
+                messageID: "message-2"
+            ),
+            TranscriptItem(
+                id: "status",
+                role: .status,
+                text: "completed",
+                runID: "run-1",
+                status: "completed"
+            ),
+        ], activeRunID: nil)
 
         guard case let .run(initialRun) = initial[0],
               case let .run(refreshedRun) = refreshed[0],
+              case let .run(completedRun) = completed[0],
               let initialOutput = initialRun.output,
-              let refreshedOutput = refreshedRun.output
+              let refreshedOutput = refreshedRun.output,
+              let completedOutput = completedRun.output
         else {
             Issue.record("Expected active output slots")
             return
         }
         #expect(initialOutput.id == refreshedOutput.id)
+        #expect(refreshedOutput.id == completedOutput.id)
+        #expect(refreshedOutput.phase == .update)
+        #expect(completedOutput.phase == .final)
         #expect(refreshedOutput.sourceItemID == "update-2")
-        #expect(refreshedOutput.text.count == TranscriptRunOutput.activePreviewLimit)
-        #expect(refreshedOutput.text == String(longUpdate.prefix(TranscriptRunOutput.activePreviewLimit)))
+        #expect(refreshedOutput.sourceMessageID == "message-2")
+        #expect(refreshedOutput.text == exactSource)
+        #expect(completedOutput.text == exactSource)
+        #expect(refreshedOutput.text.utf8.elementsEqual(exactSource.utf8))
+        #expect(completedOutput.text.utf8.elementsEqual(exactSource.utf8))
+    }
+
+    @Test func partial_terminal_status_preserves_complete_source_and_ordering() {
+        let exactSource = "\n  Partial **Markdown** 界🙂\nline two  \n"
+
+        for status in ["failed", "cancelled", "timed_out", "interrupted"] {
+            let entries = TranscriptPresentation.entries(items: [
+                TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+                TranscriptItem(
+                    id: "answer",
+                    role: .agent,
+                    text: exactSource,
+                    runID: "run-1",
+                    messageID: "message"
+                ),
+                TranscriptItem(
+                    id: "status-\(status)",
+                    role: .status,
+                    text: status,
+                    runID: "run-1",
+                    status: status
+                ),
+                TranscriptItem(
+                    id: "error-\(status)",
+                    role: .system,
+                    text: "Error: \(status)",
+                    runID: "run-1"
+                ),
+            ], activeRunID: nil)
+
+            guard case let .run(run) = entries.first,
+                  let output = run.output
+            else {
+                Issue.record("Expected partial output for \(status)")
+                continue
+            }
+            #expect(output.id == "run-run-1-output")
+            #expect(output.phase == .partial)
+            #expect(output.text == exactSource)
+            #expect(output.text.utf8.elementsEqual(exactSource.utf8))
+            #expect(output.sourceItemID == "answer")
+            #expect(output.sourceMessageID == "message")
+            #expect(run.trailingItems.map(\.id) == ["status-\(status)", "error-\(status)"])
+            #expect(run.trailingItems.first?.status == status)
+        }
     }
 }
