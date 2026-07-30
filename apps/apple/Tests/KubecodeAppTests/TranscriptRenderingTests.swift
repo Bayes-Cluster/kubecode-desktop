@@ -652,32 +652,36 @@ struct TranscriptRenderingTests {
         #expect(coordinator.applyCount == 2)
     }
 
-    @Test @MainActor func streaming_markdown_stays_plain_and_does_not_schedule_rich_rendering() async {
-        let coordinator = NativeSelectableAgentMarkdownView.Coordinator()
-        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
-        let textView = NativeAgentMarkdownTextView(frame: .zero)
-
-        coordinator.apply(
-            source: "First",
-            typography: typography,
-            tone: .primary,
-            isStreaming: true,
-            to: textView
+    @Test @MainActor func streaming_markdown_uses_the_prepared_rich_renderer() async throws {
+        let controller = NSHostingController(rootView: AgentMarkdownView(
+            source: "First **strong second**",
+            isStreaming: true
+        ).frame(width: 360, alignment: .topLeading))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 360, height: 100),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
         )
-        coordinator.apply(
-            source: "First second",
-            typography: typography,
-            tone: .primary,
-            isStreaming: true,
-            to: textView
-        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        window.layoutIfNeeded()
+        controller.view.layoutSubtreeIfNeeded()
+        let textView = try #require(firstSubview(
+            of: NativeAgentMarkdownTextView.self,
+            in: controller.view
+        ))
 
-        #expect(textView.string == "First second")
-        #expect(coordinator.applyCount == 0)
-        try? await Task.sleep(for: .milliseconds(120))
-        #expect(coordinator.applyCount == 0)
-        #expect(coordinator.renderCount == 0)
-        #expect(textView.string == "First second")
+        try await waitForPreparedMarkdown(textView, containing: "strong second")
+
+        let range = try #require(textView.string.range(of: "strong second"))
+        let font = try #require(textView.attributedString().attribute(
+            .font,
+            at: NSRange(range, in: textView.string).location,
+            effectiveRange: nil
+        ) as? NSFont)
+        #expect(NSFontManager.shared.traits(of: font).contains(.boldFontMask))
     }
 
     @Test @MainActor func native_markdown_height_cache_requires_the_exact_layout_width() {
@@ -731,7 +735,7 @@ struct TranscriptRenderingTests {
         #expect(wide > typography.pointSize)
     }
 
-    @Test @MainActor func native_markdown_container_tracks_its_final_view_frame() throws {
+    @Test @MainActor func native_markdown_container_tracks_its_final_view_frame() async throws {
         let controller = NSHostingController(rootView: AgentMarkdownView(
             source: String(repeating: "A long response must wrap at the proposed width. ", count: 20)
         ).frame(width: 320, alignment: .topLeading))
@@ -742,6 +746,8 @@ struct TranscriptRenderingTests {
             defer: false
         )
         window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
         window.layoutIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
 
@@ -749,6 +755,9 @@ struct TranscriptRenderingTests {
             of: NativeAgentMarkdownTextView.self,
             in: controller.view
         ))
+        try await waitForPreparedMarkdown(textView, containing: "A long response")
+        window.layoutIfNeeded()
+        controller.view.layoutSubtreeIfNeeded()
         #expect(textView.textContainer?.widthTracksTextView == true)
         #expect(abs((textView.textContainer?.containerSize.width ?? 0) - textView.bounds.width) < 1)
         #expect(textView.frame.height > 100)
@@ -847,7 +856,7 @@ struct TranscriptRenderingTests {
         #expect(bounds.origin.y > -bounds.height)
     }
 
-    @Test @MainActor func agent_response_context_menu_copies_raw_markdown_without_replacing_selection_copy() throws {
+    @Test @MainActor func agent_response_context_menu_copies_raw_markdown_without_replacing_selection_copy() async throws {
         let rawResponse = "**Rendered response** with $x + y$."
         let controller = NSHostingController(rootView: AgentMarkdownView(
             source: rawResponse,
@@ -866,11 +875,11 @@ struct TranscriptRenderingTests {
         defer { window.orderOut(nil) }
         window.layoutIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         let textView = try #require(firstSubview(
             of: NativeAgentMarkdownTextView.self,
             in: controller.view
         ))
+        try await waitForPreparedMarkdown(textView, containing: "Rendered response")
 
         let renderedRange = try #require(textView.string.range(of: "Rendered response"))
         textView.setSelectedRange(NSRange(renderedRange, in: textView.string))
@@ -956,7 +965,7 @@ struct TranscriptRenderingTests {
         }
     }
 
-    @Test @MainActor func agent_markdown_accepts_a_native_mouse_drag_across_visual_lines() throws {
+    @Test @MainActor func agent_markdown_accepts_a_native_mouse_drag_across_visual_lines() async throws {
         let controller = NSHostingController(rootView: AgentMarkdownView(source: """
         Drag selection starts on the first visual line and continues through enough words to wrap.
 
@@ -975,11 +984,13 @@ struct TranscriptRenderingTests {
         defer { window.orderOut(nil) }
         window.layoutIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         let textView = try #require(firstSubview(
             of: NativeAgentMarkdownTextView.self,
             in: controller.view
         ))
+        try await waitForPreparedMarkdown(textView, containing: "paragraph")
+        window.layoutIfNeeded()
+        controller.view.layoutSubtreeIfNeeded()
         let start = try #require(textView.string.range(of: "starts"))
         let end = try #require(textView.string.range(of: "paragraph"))
         let startIndex = NSRange(start, in: textView.string).location
@@ -2089,7 +2100,7 @@ struct TranscriptRenderingTests {
         }
     }
 
-    @Test @MainActor func native_agent_markdown_renders_blocks_and_core_text_math() throws {
+    @Test @MainActor func native_agent_markdown_renders_blocks_and_core_text_math() async throws {
         let controller = NSHostingController(rootView: AgentMarkdownView(source: #"""
         # Result
 
@@ -2129,13 +2140,14 @@ struct TranscriptRenderingTests {
         window.layoutIfNeeded()
         window.displayIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-        window.displayIfNeeded()
-
         let textView = try #require(firstSubview(
             of: NativeAgentMarkdownTextView.self,
             in: controller.view
         ))
+        try await waitForPreparedMarkdown(textView, containing: "answer = 42")
+        window.layoutIfNeeded()
+        controller.view.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
         #expect(Set(textView.renderedMathSources) == [
             #"\(z = 1\)"#,
             #"\[P(X=x\mid p) \propto p^x(1-p)^{n-x}\]"#,
@@ -2431,6 +2443,20 @@ struct TranscriptRenderingTests {
     private func firstSubview<T: NSView>(of type: T.Type, in root: NSView) -> T? {
         if let match = root as? T { return match }
         return root.subviews.lazy.compactMap { firstSubview(of: type, in: $0) }.first
+    }
+
+    @MainActor
+    private func waitForPreparedMarkdown(
+        _ textView: NativeAgentMarkdownTextView,
+        containing expected: String,
+        timeout: Duration = .seconds(2)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !textView.string.contains(expected), clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(textView.string.contains(expected))
     }
 #endif
 

@@ -101,10 +101,36 @@ indirect enum AgentMarkdownBlock: Equatable, Sendable {
 }
 
 struct AgentMarkdownDocument: Equatable, Sendable {
+    struct PreparedBlock: Equatable, Sendable, Identifiable {
+        let id: String
+        let sourceRange: MarkdownSourceRange?
+        let content: AgentMarkdownBlock
+    }
+
     let blocks: [AgentMarkdownBlock]
+    let preparedBlocks: [PreparedBlock]
 
     init(source: String) {
-        blocks = MarkdownParser.parse(source).blocks.map(Self.project)
+        let parsed = MarkdownParser.parse(source).blocks
+        preparedBlocks = parsed.map { block in
+            .init(
+                id: block.id,
+                sourceRange: block.sourceRange,
+                content: Self.project(block)
+            )
+        }
+        blocks = preparedBlocks.map(\.content)
+    }
+
+    init(streamingDocument: StreamingMarkdownDocument) {
+        preparedBlocks = streamingDocument.blocks.map { block in
+            .init(
+                id: block.id,
+                sourceRange: block.sourceRange,
+                content: Self.project(block.content)
+            )
+        }
+        blocks = preparedBlocks.map(\.content)
     }
 
     var inlineMath: [AgentMath] {
@@ -162,6 +188,15 @@ struct AgentMarkdownDocument: Equatable, Sendable {
                 rows: table.rows.map { $0.map(project) }
             )
         case let .rawHTML(value): .rawHTML(value)
+        }
+    }
+
+    private static func project(
+        _ content: StreamingMarkdownBlock.Content
+    ) -> AgentMarkdownBlock {
+        switch content {
+        case let .parsed(block): project(block)
+        case let .literal(source): .paragraph([.init(text: source)])
         }
     }
 
