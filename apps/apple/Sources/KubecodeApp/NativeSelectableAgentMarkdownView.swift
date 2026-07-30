@@ -112,6 +112,7 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
     let copyResponseSource: String?
     let isStreaming: Bool
     let resourceContext: MarkdownProjectResourceContext?
+    let preparedCommit: AgentMarkdownRenderCommit?
 
     init(
         source: String,
@@ -119,7 +120,8 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         tone: AgentMarkdownTone,
         copyResponseSource: String?,
         isStreaming: Bool = false,
-        resourceContext: MarkdownProjectResourceContext? = nil
+        resourceContext: MarkdownProjectResourceContext? = nil,
+        preparedCommit: AgentMarkdownRenderCommit? = nil
     ) {
         self.source = source
         self.typography = typography
@@ -127,23 +129,24 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         self.copyResponseSource = copyResponseSource
         self.isStreaming = isStreaming
         self.resourceContext = resourceContext
+        self.preparedCommit = preparedCommit
     }
 
     @MainActor
     final class Coordinator {
         private var renderedKey: RenderedKey?
         private var renderedValue: NSAttributedString?
-        private var appliedKey: RenderedKey?
+        private var legacyAppliedKey: RenderedKey?
         private var measuredWidth: CGFloat?
         private var measuredHeight: CGFloat?
         private var measuredSource: String?
         private var measuredResourceIdentity: String?
-        private var appliedSource = ""
-        private var renderTask: Task<Void, Never>?
         private var imageTask: Task<Void, Never>?
-        private var pendingKey: RenderedKey?
         private(set) var renderCount = 0
         private(set) var applyCount = 0
+        private(set) var preparedRenderCount = 0
+        private(set) var preparedApplyCount = 0
+        private(set) var latestPreparedCommit: AgentMarkdownRenderCommit?
 
         func rendered(
             source: String,
@@ -175,90 +178,56 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
             measuredHeight = nil
         }
 
-        func apply(
-            source: String,
-            typography: WorkspaceTypography,
-            tone: AgentMarkdownTone,
-            isStreaming: Bool,
+        func receivePreparedCommit(
+            _ commit: AgentMarkdownRenderCommit,
             resourceContext: MarkdownProjectResourceContext? = nil,
             to textView: NativeAgentMarkdownTextView
         ) {
-            if isStreaming {
-                renderTask?.cancel()
-                imageTask?.cancel()
-                renderTask = nil
-                imageTask = nil
-                pendingKey = nil
-                guard appliedSource != source else { return }
-                textView.textStorage?.setAttributedString(NativeAgentMarkdownRenderer.liveText(
-                    source,
-                    typography: typography,
-                    tone: tone
-                ))
-                appliedSource = source
-                measuredSource = source
-                measuredWidth = nil
-                measuredHeight = nil
+            if let latestPreparedCommit,
+               latestPreparedCommit.contentVersion > commit.contentVersion
+                || (latestPreparedCommit.contentVersion == commit.contentVersion
+                    && latestPreparedCommit.generation >= commit.generation)
+            {
                 return
             }
-
-            let key = RenderedKey(
-                source: source,
-                typography: typography,
-                tone: tone,
-                resourceIdentity: resourceContext?.identity
-            )
-            guard appliedKey != key, pendingKey != key else { return }
-            renderTask?.cancel()
             imageTask?.cancel()
-            pendingKey = key
+            imageTask = nil
+            preparedRenderCount += 1
+            let commitToApply = latestPreparedCommit.map {
+                commit.carryingStablePrefix(from: $0)
+            } ?? commit
+            applyPreparedCommit(commitToApply, to: textView)
+            loadImages(
+                for: commitToApply,
+                resourceContext: resourceContext,
+                textView: textView
+            )
+        }
 
-            if textView.string.isEmpty {
-                textView.textStorage?.setAttributedString(NativeAgentMarkdownRenderer.liveText(
-                    source,
-                    typography: typography,
-                    tone: tone
-                ))
-            }
+        func applyPreparedCommit(
+            _ commit: AgentMarkdownRenderCommit,
+            to textView: NativeAgentMarkdownTextView
+        ) {
+            latestPreparedCommit = commit
+            let result = NativeMarkdownSuffixApplier.apply(commit, to: textView)
+            if result != .unchanged { preparedApplyCount += 1 }
+            measuredSource = commit.source
+            measuredWidth = nil
+            measuredHeight = nil
+            textView.invalidateIntrinsicContentSize()
+        }
 
-            renderTask = Task { @MainActor [weak self, weak textView] in
-                let document = await Task.detached(priority: .userInitiated) {
-                    AgentMarkdownDocument(source: source)
-                }.value
-                guard let self, let textView, !Task.isCancelled, self.pendingKey == key else { return }
-                let rendered = NativeAgentMarkdownRenderer.render(
-                    document,
-                    typography: typography,
-                    tone: tone
-                )
-                self.finishApply(
-                    rendered,
-                    key: key,
-                    source: source,
-                    to: textView
-                )
-                self.loadImages(
-                    for: document,
-                    key: key,
-                    source: source,
-                    typography: typography,
-                    tone: tone,
-                    resourceContext: resourceContext,
-                    textView: textView
-                )
-            }
+        func measurementCommit(forSource source: String) -> AgentMarkdownRenderCommit? {
+            guard latestPreparedCommit?.source == source else { return nil }
+            return latestPreparedCommit
         }
 
         private func loadImages(
-            for document: AgentMarkdownDocument,
-            key: RenderedKey,
-            source: String,
-            typography: WorkspaceTypography,
-            tone: AgentMarkdownTone,
+            for commit: AgentMarkdownRenderCommit,
             resourceContext: MarkdownProjectResourceContext?,
             textView: NativeAgentMarkdownTextView
         ) {
-            let loads = document.imageLoads
+            let loads = commit.document.imageLoads
             guard !loads.isEmpty else { return }
             imageTask = Task { @MainActor [weak self, weak textView] in
                 let loaded = await withTaskGroup(
@@ -283,7 +252,9 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
                     for await value in group { values.append(value) }
                     return values
                 }
-                guard let self, let textView, !Task.isCancelled, self.appliedKey == key else { return }
+                guard let self, let textView, !Task.isCancelled,
+                      self.latestPreparedCommit === commit
+                else { return }
                 let pairs: [(String, NSImage)] = loaded.compactMap { source, data in
                     guard let data, let image = MarkdownRemoteImageDecoder.image(from: data) else { return nil }
                     return (source, image)
@@ -294,98 +265,17 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
                     self.imageTask = nil
                     return
                 }
-                let rendered = NativeAgentMarkdownRenderer.render(
-                    document,
-                    typography: typography,
-                    tone: tone,
+                let imageCommit = AgentMarkdownRenderCommit.prepare(
+                    snapshot: commit.snapshot,
+                    previous: commit,
+                    typography: commit.typography,
+                    tone: commit.tone,
                     images: images
                 )
-                self.finishImageApply(rendered, key: key, source: source, to: textView)
+                self.preparedRenderCount += 1
+                self.applyPreparedCommit(imageCommit, to: textView)
+                self.imageTask = nil
             }
-        }
-
-        private func finishApply(
-            _ rendered: NSAttributedString,
-            key: RenderedKey,
-            source: String,
-            to textView: NativeAgentMarkdownTextView
-        ) {
-            let selection = textView.selectedRange()
-            textView.textStorage?.setAttributedString(rendered)
-            if selection.location != NSNotFound,
-               selection.length > 0,
-               NSMaxRange(selection) <= rendered.length {
-                textView.setSelectedRange(selection)
-            }
-            renderedKey = key
-            renderedValue = rendered
-            appliedKey = key
-            pendingKey = nil
-            renderTask = nil
-            appliedSource = source
-            measuredSource = source
-            measuredWidth = nil
-            measuredHeight = nil
-            renderCount += 1
-            applyCount += 1
-            textView.invalidateIntrinsicContentSize()
-        }
-
-        private func finishImageApply(
-            _ rendered: NSAttributedString,
-            key: RenderedKey,
-            source: String,
-            to textView: NativeAgentMarkdownTextView
-        ) {
-            guard appliedKey == key, appliedSource == source else { return }
-            let selection = textView.selectedRange()
-            textView.textStorage?.setAttributedString(rendered)
-            if selection.location != NSNotFound,
-               selection.length > 0,
-               NSMaxRange(selection) <= rendered.length {
-                textView.setSelectedRange(selection)
-            }
-            renderedKey = key
-            renderedValue = rendered
-            measuredWidth = nil
-            measuredHeight = nil
-            imageTask = nil
-            applyCount += 1
-            textView.invalidateIntrinsicContentSize()
-        }
-
-        func measurementValue(
-            source: String,
-            typography: WorkspaceTypography,
-            tone: AgentMarkdownTone,
-            isStreaming: Bool,
-            resourceIdentity: String? = nil
-        ) -> NSAttributedString {
-            let key = RenderedKey(
-                source: source,
-                typography: typography,
-                tone: tone,
-                resourceIdentity: resourceIdentity
-            )
-            if renderedKey == key, let renderedValue { return renderedValue }
-            guard !isStreaming else {
-                return NativeAgentMarkdownRenderer.liveText(
-                    source,
-                    typography: typography,
-                    tone: tone
-                )
-            }
-            let value = NativeAgentMarkdownRenderer.render(
-                AgentMarkdownDocument(source: source),
-                typography: typography,
-                tone: tone
-            )
-            renderedKey = key
-            renderedValue = value
-            measuredWidth = nil
-            measuredHeight = nil
-            renderCount += 1
-            return value
         }
 
         func renderedUpdate(
@@ -394,9 +284,9 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
             tone: AgentMarkdownTone
         ) -> NSAttributedString? {
             let key = RenderedKey(source: source, typography: typography, tone: tone)
-            guard appliedKey != key else { return nil }
+            guard legacyAppliedKey != key else { return nil }
             let value = rendered(source: source, typography: typography, tone: tone)
-            appliedKey = key
+            legacyAppliedKey = key
             applyCount += 1
             return value
         }
@@ -429,6 +319,7 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
                 self.resourceIdentity = resourceIdentity
             }
         }
+
     }
 
     func makeCoordinator() -> Coordinator {
@@ -478,20 +369,16 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
             source: source,
             resourceIdentity: resourceContext?.identity
         )
-        let rendered = context.coordinator.measurementValue(
-            source: source,
-            typography: typography,
-            tone: tone,
-            isStreaming: isStreaming,
-            resourceIdentity: resourceContext?.identity
-        )
+        guard let commit = context.coordinator.measurementCommit(forSource: source) else {
+            return nil
+        }
         if let height = context.coordinator.cachedHeight(for: width) {
             return CGSize(width: width, height: height)
         }
         let resolvedHeight = NativeAgentMarkdownMeasurement.height(
-            for: rendered,
+            for: commit.attributedValue,
             width: width,
-            minimumHeight: typography.pointSize + 2,
+            minimumHeight: commit.typography.pointSize + 2,
             verticalInset: textView.textContainerInset.height
         )
         context.coordinator.cacheHeight(resolvedHeight, for: width)
@@ -503,11 +390,9 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         coordinator: Coordinator
     ) {
         textView.copyResponseSource = copyResponseSource
-        coordinator.apply(
-            source: source,
-            typography: typography,
-            tone: tone,
-            isStreaming: isStreaming,
+        guard let preparedCommit else { return }
+        coordinator.receivePreparedCommit(
+            preparedCommit,
             resourceContext: resourceContext,
             to: textView
         )
@@ -531,22 +416,6 @@ enum NativeAgentMarkdownMeasurement {
 
 @MainActor
 enum NativeAgentMarkdownRenderer {
-    static func liveText(
-        _ source: String,
-        typography: WorkspaceTypography,
-        tone: AgentMarkdownTone
-    ) -> NSAttributedString {
-        NSAttributedString(
-            string: source,
-            attributes: [
-                .font: typography.nsFont(for: .body),
-                .foregroundColor: tone == .primary
-                    ? NSColor.labelColor
-                    : NSColor.secondaryLabelColor,
-            ]
-        )
-    }
-
     static func render(
         _ document: AgentMarkdownDocument,
         typography: WorkspaceTypography,
@@ -555,22 +424,36 @@ enum NativeAgentMarkdownRenderer {
     ) -> NSAttributedString {
         let output = NSMutableAttributedString()
         for (index, block) in document.blocks.enumerated() {
-            let renderedBlock = NSMutableAttributedString()
-            append(
-                block,
-                to: renderedBlock,
+            output.append(render(
+                block: block,
                 typography: typography,
                 tone: tone,
-                listDepth: 0,
                 images: images
-            )
-            trimBoundaryLineBreaks(renderedBlock)
-            output.append(renderedBlock)
+            ))
             if index < document.blocks.count - 1 {
                 output.append(NSAttributedString(string: "\n"))
             }
         }
         return output
+    }
+
+    static func render(
+        block: AgentMarkdownBlock,
+        typography: WorkspaceTypography,
+        tone: AgentMarkdownTone,
+        images: [String: NSImage] = [:]
+    ) -> NSAttributedString {
+        let output = NSMutableAttributedString()
+        append(
+            block,
+            to: output,
+            typography: typography,
+            tone: tone,
+            listDepth: 0,
+            images: images
+        )
+        trimBoundaryLineBreaks(output)
+        return NSAttributedString(attributedString: output)
     }
 
     private static func trimBoundaryLineBreaks(_ value: NSMutableAttributedString) {

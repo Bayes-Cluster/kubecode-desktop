@@ -12,6 +12,7 @@ struct AgentMarkdownView: View {
     private let tone: AgentMarkdownTone
     private let copyResponseSource: String?
     private let isStreaming: Bool
+    @State private var renderSession = AgentMarkdownRenderSession()
 
     init(
         source: String,
@@ -26,16 +27,43 @@ struct AgentMarkdownView: View {
     }
 
     var body: some View {
+        let input = AgentMarkdownRenderInput(
+            source: source,
+            typography: typography,
+            tone: tone,
+            resourceIdentity: resourceContext?.identity,
+            isStreaming: isStreaming
+        )
         NativeSelectableAgentMarkdownView(
             source: source,
             typography: typography,
             tone: tone,
             copyResponseSource: copyResponseSource,
             isStreaming: isStreaming,
-            resourceContext: resourceContext
+            resourceContext: resourceContext,
+            preparedCommit: renderSession.latestCommit
         )
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear { submit(input) }
+        .onChange(of: input) { _, value in submit(value) }
     }
+
+    private func submit(_ input: AgentMarkdownRenderInput) {
+        _ = renderSession.submit(
+            source: input.source,
+            typography: input.typography,
+            tone: input.tone,
+            resourceIdentity: input.resourceIdentity
+        )
+    }
+}
+
+private struct AgentMarkdownRenderInput: Equatable {
+    let source: String
+    let typography: WorkspaceTypography
+    let tone: AgentMarkdownTone
+    let resourceIdentity: String?
+    let isStreaming: Bool
 }
 
 private struct MarkdownProjectResourceContextKey: EnvironmentKey {
