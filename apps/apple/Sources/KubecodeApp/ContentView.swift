@@ -69,6 +69,17 @@ private enum TranscriptSurfaceEntry: Identifiable, Hashable {
         else { return .immediate }
         return .animated
     }
+
+    var contentRevision: Int {
+        switch self {
+        case let .runOutput(output):
+            return TranscriptRunOutputContentIdentity(output: output).contentRevision
+        default:
+            var hasher = Hasher()
+            hash(into: &hasher)
+            return hasher.finalize()
+        }
+    }
 }
 
 private struct ComposerOverlayHeightKey: PreferenceKey {
@@ -92,11 +103,9 @@ private struct TranscriptViewport: View {
     var body: some View {
         NativeTranscriptCollectionView(
             items: entries.map { entry in
-                var hasher = Hasher()
-                entry.hash(into: &hasher)
                 return NativeTranscriptItem(
                     id: entry.id,
-                    contentRevision: hasher.finalize(),
+                    contentRevision: entry.contentRevision,
                     layoutRevision: layoutRevision(entry.id),
                     resizePolicy: entry.resizePolicy
                 )
@@ -2138,7 +2147,7 @@ struct ContentView: View {
                 )
             )
         case let .runOutput(output):
-            runOutputRow(output)
+            TranscriptRunOutputRow(output: output)
         case let .activityStep(item, ownerID, isCurrent):
             activityStepRow(item, ownerID: ownerID, isCurrent: isCurrent)
                 .padding(.leading, 2)
@@ -2198,42 +2207,6 @@ struct ContentView: View {
             )
         })
         return entries
-    }
-
-    @ViewBuilder
-    private func runOutputRow(_ output: TranscriptRunOutput) -> some View {
-        switch output.phase {
-        case .update:
-            VStack(alignment: .leading, spacing: 5) {
-                Label("Update", systemImage: "text.bubble")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text(output.text)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-                    .truncationMode(.tail)
-                    .textSelection(.enabled)
-            }
-            .frame(maxWidth: 720, alignment: .leading)
-        case .final:
-            AgentMarkdownView(
-                source: output.text,
-                copyResponseSource: output.text
-            )
-            .frame(maxWidth: 760, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        case .partial:
-            VStack(alignment: .leading, spacing: 5) {
-                Label("Partial output", systemImage: "text.bubble")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                AgentMarkdownView(
-                    source: output.text,
-                    copyResponseSource: output.text
-                )
-                .frame(maxWidth: 720, alignment: .leading)
-            }
-        }
     }
 
     private func transcriptTitle(_ item: TranscriptItem) -> String {

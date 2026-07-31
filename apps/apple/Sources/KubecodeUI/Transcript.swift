@@ -81,8 +81,6 @@ public enum TranscriptRunOutputPhase: Hashable, Sendable {
 }
 
 public struct TranscriptRunOutput: Identifiable, Hashable, Sendable {
-    public static let activePreviewLimit = 220
-
     public let runID: String
     public let text: String
     public let phase: TranscriptRunOutputPhase
@@ -193,21 +191,16 @@ public enum TranscriptPresentation {
             : nil
         let output = items.last(where: { $0.role == .agent }).map { item in
             let phase: TranscriptRunOutputPhase
-            let text: String
             if status == "completed" {
                 phase = .final
-                text = item.text
             } else if status != nil || !isActive {
                 phase = .partial
-                text = item.text
             } else {
                 phase = .update
-                let trimmed = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                text = String(trimmed.prefix(TranscriptRunOutput.activePreviewLimit))
             }
             return TranscriptRunOutput(
                 runID: runID,
-                text: text,
+                text: item.text,
                 phase: phase,
                 sourceItemID: item.id,
                 sourceMessageID: item.messageID
