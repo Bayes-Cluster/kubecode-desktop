@@ -7,6 +7,44 @@ import KubecodeMacRuntime
 
 @Suite
 struct WorkspaceNavigationIndexTests {
+    @Test @MainActor func file_change_publishes_one_safe_path_scoped_markdown_invalidation() async throws {
+        let model = AppModel(connections: MacConnectionManager())
+        model.selectedProjectID = "project-1"
+        let first = try decode(
+            WorkspaceEvent.self,
+            from: #"{"id":11,"kind":"file_changed","project_id":"project-1","conversation_id":null,"run_id":null,"payload":{"path":"docs/diagram.png"},"created_at":"now"}"#
+        )
+
+        await model.handleWorkspaceEvent(first)
+        await model.handleWorkspaceEvent(first)
+        #expect(model.markdownResourceInvalidation == .init(
+            eventID: 11,
+            projectID: "project-1",
+            projectPath: "docs/diagram.png"
+        ))
+
+        let unrelated = try decode(
+            WorkspaceEvent.self,
+            from: #"{"id":12,"kind":"file_changed","project_id":"project-2","conversation_id":null,"run_id":null,"payload":{"path":"docs/diagram.png"},"created_at":"now"}"#
+        )
+        await model.handleWorkspaceEvent(unrelated)
+        #expect(model.markdownResourceInvalidation?.eventID == 11)
+
+        let unsafe = try decode(
+            WorkspaceEvent.self,
+            from: #"{"id":13,"kind":"file_changed","project_id":"project-1","conversation_id":null,"run_id":null,"payload":{"path":"../secret.png"},"created_at":"now"}"#
+        )
+        await model.handleWorkspaceEvent(unsafe)
+        #expect(model.markdownResourceInvalidation?.eventID == 11)
+
+        let stale = try decode(
+            WorkspaceEvent.self,
+            from: #"{"id":10,"kind":"file_changed","project_id":"project-1","conversation_id":null,"run_id":null,"payload":{"path":"docs/other.png"},"created_at":"now"}"#
+        )
+        await model.handleWorkspaceEvent(stale)
+        #expect(model.markdownResourceInvalidation?.eventID == 11)
+    }
+
     @Test func search_matches_projects_sessions_and_teams_across_projects() throws {
         let research = try project(id: "project-research", name: "Research Lab")
         let product = try project(id: "project-product", name: "Product")

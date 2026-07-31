@@ -754,6 +754,16 @@ struct ContentView: View {
         .onChange(of: model.selectedProjectNeedsFolderAccess) { _, requiresAccess in
             if requiresAccess { sessionWorkspace.autosaveScheduler.cancelAll() }
         }
+        .onChange(of: model.markdownResourceInvalidation) { _, invalidation in
+            guard let invalidation,
+                  invalidation.projectID == model.selectedProjectID,
+                  let resourceContext = model.markdownProjectResourceContext
+            else { return }
+            sessionWorkspace.invalidateMarkdownResources(
+                identity: resourceContext.identity,
+                projectPath: invalidation.projectPath
+            )
+        }
         .onDisappear {
             sessionWorkspace.autosaveScheduler.cancelAll()
         }

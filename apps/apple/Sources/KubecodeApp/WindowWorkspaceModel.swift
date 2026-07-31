@@ -83,8 +83,11 @@ final class SessionWorkspaceModel {
         markdownRenderStore.removeAll()
     }
 
-    func invalidateMarkdownResources(identity: String) {
-        markdownRenderStore.invalidateResourceContext(identity: identity)
+    func invalidateMarkdownResources(identity: String, projectPath: String? = nil) {
+        markdownRenderStore.invalidateResourceContext(
+            identity: identity,
+            projectPath: projectPath
+        )
     }
 
     private func transcriptExpansionKey(sessionID: String?, itemID: String) -> String {

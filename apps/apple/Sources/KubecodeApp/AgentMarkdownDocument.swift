@@ -50,6 +50,23 @@ struct AgentMarkdownImageLoad: Equatable, Sendable {
     let projectPath: String?
 }
 
+enum AgentMarkdownLinkPolicy {
+    private static let allowedSchemes = Set(["http", "https", "mailto"])
+
+    static func destination(_ rawValue: String?) -> URL? {
+        guard let rawValue,
+              let url = URL(string: rawValue),
+              allows(url)
+        else { return nil }
+        return url
+    }
+
+    static func allows(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return allowedSchemes.contains(scheme)
+    }
+}
+
 struct AgentMarkdownRun: Equatable, Sendable {
     let text: String
     let traits: AgentMarkdownTraits
@@ -210,7 +227,7 @@ struct AgentMarkdownDocument: Equatable, Sendable {
             case let .math(value):
                 return [.init(text: value.renderSource, math: .init(value))]
             case let .link(destination, _, children):
-                let url = safeDestination(destination)
+                let url = AgentMarkdownLinkPolicy.destination(destination)
                 return project(children).map { run in
                     .init(
                         text: run.text,
@@ -243,14 +260,6 @@ struct AgentMarkdownDocument: Equatable, Sendable {
         return result
     }
 
-    private static func safeDestination(_ destination: String?) -> URL? {
-        guard let destination,
-              let url = URL(string: destination),
-              let scheme = url.scheme?.lowercased(),
-              ["http", "https", "mailto"].contains(scheme)
-        else { return nil }
-        return url
-    }
 }
 
 private extension AgentMarkdownBlock {

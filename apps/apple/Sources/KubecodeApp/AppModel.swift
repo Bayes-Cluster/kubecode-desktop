@@ -3,6 +3,7 @@ import Foundation
 import Observation
 import KubecodeCore
 import KubecodeKit
+import KubecodeMarkdown
 import KubecodeMacRuntime
 import KubecodeUI
 
@@ -105,6 +106,12 @@ struct SessionSetupRequest: Identifiable, Equatable {
     }
 }
 
+struct MarkdownResourceInvalidation: Equatable {
+    let eventID: Int
+    let projectID: String
+    let projectPath: String?
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -166,6 +173,7 @@ final class AppModel {
     var isSearchingQuickOpen = false
     var quickOpenResults: [FileEntry] = []
     var isRunStreamReconnecting = false
+    private(set) var markdownResourceInvalidation: MarkdownResourceInvalidation?
     private(set) var forcedReadOnlyConversationID: String?
 
     private var server: ServerSession?
@@ -187,6 +195,7 @@ final class AppModel {
     private var windowPersistenceID = UUID().uuidString
     private var terminalWorkspaceProjectID: String?
     private var isRestoringSessionDraft = false
+    private var latestMarkdownResourceEventID: Int?
 
     init(
         connections: MacConnectionManager,
@@ -409,6 +418,8 @@ final class AppModel {
                     currentServerName = "Local Runtime"
                 }
                 selectedProjectID = nil
+                markdownResourceInvalidation = nil
+                latestMarkdownResourceEventID = nil
                 switchComposer(to: nil)
                 selectedTeamID = nil
                 projects = []
@@ -454,6 +465,8 @@ final class AppModel {
         cancelProjectResourceLoads()
         forcedReadOnlyConversationID = nil
         selectedProjectID = project.id
+        markdownResourceInvalidation = nil
+        latestMarkdownResourceEventID = nil
         switchComposer(to: nil)
         selectedTeamID = nil
         terminalWorkspace = .empty
@@ -2404,6 +2417,7 @@ final class AppModel {
                 }
             }
         case "file_changed":
+            publishMarkdownResourceInvalidation(event)
             await reloadFileTree()
         case "git_changed":
             if !selectedProjectNeedsFolderAccess,
@@ -2423,6 +2437,21 @@ final class AppModel {
         default:
             break
         }
+    }
+
+    private func publishMarkdownResourceInvalidation(_ event: WorkspaceEvent) {
+        guard let projectID = event.projectID,
+              latestMarkdownResourceEventID.map({ event.id > $0 }) ?? true
+        else { return }
+        let rawPath = event.payload["path"]?.stringValue
+        let projectPath = rawPath.flatMap(MarkdownResourcePolicy.projectRelativeImagePath)
+        guard rawPath == nil || projectPath != nil else { return }
+        latestMarkdownResourceEventID = event.id
+        markdownResourceInvalidation = .init(
+            eventID: event.id,
+            projectID: projectID,
+            projectPath: projectPath
+        )
     }
 
     private func replaceConversation(_ conversation: Conversation) {

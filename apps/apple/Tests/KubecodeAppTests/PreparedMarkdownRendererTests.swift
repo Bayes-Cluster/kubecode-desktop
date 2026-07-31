@@ -1,11 +1,12 @@
 import AppKit
+import KubecodeKit
 import KubecodeMarkdown
 import KubecodeMacUI
 import SwiftUI
 import Testing
 @testable import KubecodeApp
 
-@Suite
+@Suite(.serialized)
 struct PreparedMarkdownRendererTests {
     private let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
 
@@ -298,6 +299,313 @@ struct PreparedMarkdownRendererTests {
         let duplicateGeometry = geometry.submit(settledTarget)
         #expect(duplicateGeometry == nil)
         #expect(geometry.nextTransactionGeneration == 2)
+    }
+
+    @Test @MainActor func superseded_attachment_completion_cannot_publish_during_newer_render_request() async throws {
+        let documentScheduler = ManualPreparedDocumentScheduler()
+        let resolver = GatedMarkdownAttachmentResolver(data: try imageData())
+        let store = AgentMarkdownRenderStore(
+            documentScheduler: documentScheduler.schedule,
+            attachmentResolver: { _, _ in await resolver.resolve() }
+        )
+
+        #expect(store.submit(
+            rowID: "image",
+            source: "![old](asset.png)\n\nold tail",
+            typography: typography,
+            tone: .primary
+        ) == .accepted(contentVersion: 1))
+        await documentScheduler.release(0)
+        await documentScheduler.tasks[0].value
+        try await waitUntil { store.latestRenderCommit(rowID: "image") != nil }
+        try await resolver.waitForCallCount(1)
+        let unresolved = try #require(store.latestRenderInputs(rowID: "image"))
+        #expect(unresolved.renderPublicationVersion == 1)
+        #expect(unresolved.attachmentResolutionGeneration == 0)
+
+        #expect(store.submit(
+            rowID: "image",
+            source: "![new](asset.png)\n\nnew tail",
+            typography: typography,
+            tone: .primary
+        ) == .accepted(contentVersion: 2))
+        await resolver.release(0)
+        await resolver.waitForCompletion(0)
+        for _ in 0..<8 { await Task.yield() }
+
+        #expect(store.latestRenderInputs(rowID: "image") == unresolved)
+
+        await documentScheduler.release(1)
+        await documentScheduler.tasks[1].value
+        try await resolver.waitForCallCount(2)
+        await resolver.release(1)
+        await resolver.waitForCompletion(1)
+        try await waitUntil {
+            store.latestRenderInputs(rowID: "image")?.attachmentResolutionGeneration == 1
+        }
+        let settled = try #require(store.latestRenderInputs(rowID: "image"))
+        #expect(settled.contentVersion == 2)
+        #expect(settled.renderPublicationVersion == 3)
+        #expect(settled.attachmentResolutionGeneration == 1)
+        #expect(await resolver.callCount == 2)
+    }
+
+    @Test @MainActor func phase_only_duplicate_keeps_one_attachment_resolution() async throws {
+        let documentScheduler = ManualPreparedDocumentScheduler()
+        let resolver = GatedMarkdownAttachmentResolver(data: try imageData())
+        let store = AgentMarkdownRenderStore(
+            documentScheduler: documentScheduler.schedule,
+            attachmentResolver: { _, _ in await resolver.resolve() }
+        )
+        let source = "![pixel](asset.png)"
+
+        #expect(store.submit(
+            rowID: "image",
+            source: source,
+            typography: typography,
+            tone: .primary
+        ) == .accepted(contentVersion: 1))
+        await documentScheduler.release(0)
+        await documentScheduler.tasks[0].value
+        try await resolver.waitForCallCount(1)
+        #expect(store.submit(
+            rowID: "image",
+            source: source,
+            typography: typography,
+            tone: .primary
+        ) == .unchanged(contentVersion: 1))
+        #expect(await resolver.callCount == 1)
+
+        await resolver.release(0)
+        await resolver.waitForCompletion(0)
+        try await waitUntil {
+            store.latestRenderInputs(rowID: "image")?.attachmentResolutionGeneration == 1
+        }
+        let settled = try #require(store.latestRenderInputs(rowID: "image"))
+        #expect(settled.renderPublicationVersion == 2)
+        #expect(settled.attachmentResolutionGeneration == 1)
+        #expect(await resolver.callCount == 1)
+    }
+
+    @Test @MainActor func project_resource_invalidation_refreshes_only_matching_image_rows() async throws {
+        let client = RuntimeClient(
+            origin: URL(string: "http://127.0.0.1:1")!,
+            token: "test"
+        )
+        let context = MarkdownProjectResourceContext(
+            identity: "server:project",
+            projectID: "project",
+            client: client
+        )
+        let store = AgentMarkdownRenderStore(attachmentResolver: { _, _ in nil })
+        _ = store.submit(
+            rowID: "diagram",
+            source: "![diagram](docs/diagram.png)",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        _ = store.submit(
+            rowID: "other",
+            source: "![other](docs/other.png)",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        _ = store.submit(
+            rowID: "remote",
+            source: "![remote](https://example.com/image.png)",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        _ = store.submit(
+            rowID: "text",
+            source: "No image dependency",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        try await waitUntil {
+            store.latestRenderInputs(rowID: "diagram") != nil
+                && store.latestRenderInputs(rowID: "other") != nil
+                && store.latestRenderInputs(rowID: "remote") != nil
+                && store.latestRenderInputs(rowID: "text") != nil
+        }
+        let otherInputs = try #require(store.latestRenderInputs(rowID: "other"))
+        let remoteInputs = try #require(store.latestRenderInputs(rowID: "remote"))
+        let textInputs = try #require(store.latestRenderInputs(rowID: "text"))
+
+        #expect(store.invalidateResourceContext(
+            identity: context.identity,
+            projectPath: "docs/diagram.png"
+        ) == 1)
+        try await waitUntil {
+            store.latestRenderInputs(rowID: "diagram")?.resourceGeneration == 2
+        }
+
+        #expect(store.latestRenderInputs(rowID: "other") == otherInputs)
+        #expect(store.latestRenderInputs(rowID: "remote") == remoteInputs)
+        #expect(store.latestRenderInputs(rowID: "text") == textInputs)
+        #expect(store.invalidateResourceContext(
+            identity: context.identity,
+            projectPath: "../secret.png"
+        ) == 0)
+    }
+
+    @Test @MainActor func path_invalidation_does_not_refresh_an_unrelated_row_on_its_next_submit() async throws {
+        let client = RuntimeClient(
+            origin: URL(string: "http://127.0.0.1:1")!,
+            token: "test"
+        )
+        let context = MarkdownProjectResourceContext(
+            identity: "server:project",
+            projectID: "project",
+            client: client
+        )
+        let resolver = MarkdownAttachmentResolver(data: try imageData())
+        let store = AgentMarkdownRenderStore(attachmentResolver: { _, _ in
+            await resolver.resolve()
+        })
+        _ = store.submit(
+            rowID: "diagram",
+            source: "![diagram](docs/diagram.png)",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        _ = store.submit(
+            rowID: "other",
+            source: "![other](docs/other.png)",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        try await waitUntil {
+            store.latestRenderInputs(rowID: "diagram")?.attachmentResolutionGeneration == 1
+                && store.latestRenderInputs(rowID: "other")?.attachmentResolutionGeneration == 1
+        }
+        let otherInputs = try #require(store.latestRenderInputs(rowID: "other"))
+        let resolverCallsBeforeInvalidation = await resolver.callCount
+
+        #expect(store.invalidateResourceContext(
+            identity: context.identity,
+            projectPath: "docs/diagram.png"
+        ) == 1)
+        try await waitUntil {
+            store.latestRenderInputs(rowID: "diagram")?.resourceGeneration == 2
+        }
+        await resolver.waitForCallCount(resolverCallsBeforeInvalidation + 1)
+        let resolverCallsAfterInvalidation = await resolver.callCount
+        #expect(resolverCallsAfterInvalidation == resolverCallsBeforeInvalidation + 1)
+
+        let result = store.submit(
+            rowID: "other",
+            source: "![other](docs/other.png)",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        for _ in 0..<8 { await Task.yield() }
+
+        #expect(result == .unchanged(contentVersion: otherInputs.contentVersion))
+        #expect(store.latestRenderInputs(rowID: "other") == otherInputs)
+        #expect(await resolver.callCount == resolverCallsAfterInvalidation)
+    }
+
+    @Test @MainActor func local_path_invalidation_skips_unprepared_text_and_remote_rows() async throws {
+        let client = RuntimeClient(
+            origin: URL(string: "http://127.0.0.1:1")!,
+            token: "test"
+        )
+        let context = MarkdownProjectResourceContext(
+            identity: "server:project",
+            projectID: "project",
+            client: client
+        )
+        let documentScheduler = ManualPreparedDocumentScheduler()
+        let store = AgentMarkdownRenderStore(documentScheduler: documentScheduler.schedule)
+        _ = store.submit(
+            rowID: "pending-text",
+            source: "No local image dependency",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        _ = store.submit(
+            rowID: "pending-remote",
+            source: "![remote](https://example.com/image.png)",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+
+        #expect(store.invalidateResourceContext(
+            identity: context.identity,
+            projectPath: "docs/diagram.png"
+        ) == 0)
+        #expect(store.latestRenderCommit(rowID: "pending-text") == nil)
+        #expect(store.latestRenderCommit(rowID: "pending-remote") == nil)
+        #expect(documentScheduler.tasks.count == 2)
+
+        await documentScheduler.release(0)
+        await documentScheduler.release(1)
+        for task in documentScheduler.tasks { await task.value }
+    }
+
+    @Test @MainActor func project_invalidation_cancels_the_old_attachment_epoch_before_resubmit() async throws {
+        let client = RuntimeClient(
+            origin: URL(string: "http://127.0.0.1:1")!,
+            token: "test"
+        )
+        let context = MarkdownProjectResourceContext(
+            identity: "server:project",
+            projectID: "project",
+            client: client
+        )
+        let documentScheduler = ManualPreparedDocumentScheduler()
+        let resolver = GatedMarkdownAttachmentResolver(data: try imageData())
+        let store = AgentMarkdownRenderStore(
+            documentScheduler: documentScheduler.schedule,
+            attachmentResolver: { _, _ in await resolver.resolve() }
+        )
+        _ = store.submit(
+            rowID: "diagram",
+            source: "![diagram](docs/diagram.png)",
+            typography: typography,
+            tone: .primary,
+            resourceContext: context
+        )
+        await documentScheduler.release(0)
+        await documentScheduler.tasks[0].value
+        try await resolver.waitForCallCount(1)
+        let unresolved = try #require(store.latestRenderInputs(rowID: "diagram"))
+
+        #expect(store.invalidateResourceContext(
+            identity: context.identity,
+            projectPath: "docs/diagram.png"
+        ) == 1)
+        try await waitUntil {
+            store.latestRenderInputs(rowID: "diagram")?.resourceGeneration == 2
+        }
+        try await resolver.waitForCallCount(2)
+        let refreshed = try #require(store.latestRenderInputs(rowID: "diagram"))
+        #expect(refreshed.renderPublicationVersion == unresolved.renderPublicationVersion + 1)
+        #expect(refreshed.attachmentResolutionGeneration == 0)
+
+        await resolver.release(0)
+        await resolver.waitForCompletion(0)
+        for _ in 0..<8 { await Task.yield() }
+        #expect(store.latestRenderInputs(rowID: "diagram") == refreshed)
+
+        await resolver.release(1)
+        await resolver.waitForCompletion(1)
+        try await waitUntil {
+            store.latestRenderInputs(rowID: "diagram")?.attachmentResolutionGeneration == 1
+        }
+        let settled = try #require(store.latestRenderInputs(rowID: "diagram"))
+        #expect(settled.resourceGeneration == 2)
+        #expect(settled.renderPublicationVersion == refreshed.renderPublicationVersion + 1)
     }
 
     @Test @MainActor func visible_and_hidden_hosts_share_the_prepared_row_commit() async throws {
@@ -749,9 +1057,25 @@ struct PreparedMarkdownRendererTests {
         )
     }
 
+    private func imageData() throws -> Data {
+        let bitmap = try #require(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 20,
+            pixelsHigh: 10,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        return try #require(bitmap.representation(using: .png, properties: [:]))
+    }
+
     @MainActor
     private func waitUntil(
-        timeout: Duration = .seconds(2),
+        timeout: Duration = .seconds(10),
         _ condition: @escaping @MainActor () -> Bool
     ) async throws {
         let clock = ContinuousClock()
@@ -816,6 +1140,7 @@ private actor ManualPreparedRenderGate {
 
 private actor MarkdownAttachmentResolver {
     private let data: Data
+    private var callCountWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private(set) var callCount = 0
 
     init(data: Data) {
@@ -824,7 +1149,89 @@ private actor MarkdownAttachmentResolver {
 
     func resolve() -> Data {
         callCount += 1
+        for expected in callCountWaiters.keys.filter({ $0 <= callCount }) {
+            for continuation in callCountWaiters.removeValue(forKey: expected) ?? [] {
+                continuation.resume()
+            }
+        }
         return data
+    }
+
+    func waitForCallCount(_ expected: Int) async {
+        guard callCount < expected else { return }
+        await withCheckedContinuation { continuation in
+            callCountWaiters[expected, default: []].append(continuation)
+        }
+    }
+}
+
+private actor GatedMarkdownAttachmentResolver {
+    private let data: Data
+    private let gate = ManualPreparedRenderGate()
+    private var callCountWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var completionWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var completed: Set<Int> = []
+    private(set) var callCount = 0
+
+    init(data: Data) {
+        self.data = data
+    }
+
+    func resolve() async -> Data {
+        let index = callCount
+        callCount += 1
+        for expected in callCountWaiters.keys.filter({ $0 <= callCount }) {
+            for continuation in callCountWaiters.removeValue(forKey: expected) ?? [] {
+                continuation.resume()
+            }
+        }
+        await gate.wait(for: index)
+        completed.insert(index)
+        for continuation in completionWaiters.removeValue(forKey: index) ?? [] {
+            continuation.resume()
+        }
+        return data
+    }
+
+    func release(_ index: Int) async {
+        await gate.release(index)
+    }
+
+    func waitForCallCount(_ expected: Int) async throws {
+        if callCount >= expected { return }
+        await withCheckedContinuation { continuation in
+            callCountWaiters[expected, default: []].append(continuation)
+        }
+    }
+
+    func waitForCompletion(_ index: Int) async {
+        if completed.contains(index) { return }
+        await withCheckedContinuation { continuation in
+            completionWaiters[index, default: []].append(continuation)
+        }
+    }
+}
+
+@MainActor
+private final class ManualPreparedDocumentScheduler {
+    private let gate = ManualPreparedRenderGate()
+    private(set) var tasks: [Task<Void, Never>] = []
+
+    func schedule(
+        _ operation: @escaping @Sendable () async -> Void
+    ) -> Task<Void, Never> {
+        let index = tasks.count
+        let gate = gate
+        let task = Task {
+            await gate.wait(for: index)
+            await operation()
+        }
+        tasks.append(task)
+        return task
+    }
+
+    func release(_ index: Int) async {
+        await gate.release(index)
     }
 }
 

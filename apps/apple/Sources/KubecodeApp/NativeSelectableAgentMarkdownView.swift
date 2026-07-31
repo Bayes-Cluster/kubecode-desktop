@@ -10,13 +10,24 @@ enum AgentMarkdownTone: Equatable, Hashable {
 private extension NSAttributedString.Key {
     static let kubecodeMathSource = NSAttributedString.Key("dev.kubecode.math-source")
     static let kubecodeMathPointSize = NSAttributedString.Key("dev.kubecode.math-point-size")
+    static let kubecodeAccessibilityReplacement = NSAttributedString.Key(
+        "dev.kubecode.accessibility-replacement"
+    )
 }
 
 final class NativeAgentMarkdownTextView: NSTextView {
-    var copyResponseSource: String?
+    private var publishedAccessibilityValue: String?
+    var copyResponseSource: String? {
+        didSet { updateAccessibilityCustomActions() }
+    }
+    var linkOpener: ((URL) -> Void)?
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+    }
+
+    override func accessibilityValue() -> String? {
+        publishedAccessibilityValue ?? super.accessibilityValue()
     }
 
     var renderedMathSources: [String] {
@@ -56,7 +67,7 @@ final class NativeAgentMarkdownTextView: NSTextView {
         )
         var replacements: [(NSRange, String)] = []
         selected.enumerateAttribute(
-            .kubecodeMathSource,
+            .kubecodeAccessibilityReplacement,
             in: NSRange(location: 0, length: selected.length)
         ) { value, range, _ in
             if let source = value as? String {
@@ -69,6 +80,23 @@ final class NativeAgentMarkdownTextView: NSTextView {
 
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(selected.string, forType: .string)
+    }
+
+    override func clicked(onLink link: Any, at charIndex: Int) {
+        let url: URL?
+        if let link = link as? URL {
+            url = link
+        } else if let link = link as? String {
+            url = URL(string: link)
+        } else {
+            url = nil
+        }
+        guard let url, AgentMarkdownLinkPolicy.allows(url) else { return }
+        if let linkOpener {
+            linkOpener(url)
+        } else {
+            super.clicked(onLink: url, at: charIndex)
+        }
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -98,10 +126,45 @@ final class NativeAgentMarkdownTextView: NSTextView {
         return menu
     }
 
-    @objc private func copyResponse(_ sender: Any?) {
-        guard let copyResponseSource else { return }
+    @discardableResult
+    private func copyResponseToPasteboard() -> Bool {
+        guard let copyResponseSource, !copyResponseSource.isEmpty else { return false }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(copyResponseSource, forType: .string)
+        return true
+    }
+
+    @objc private func copyResponse(_ sender: Any?) {
+        _ = copyResponseToPasteboard()
+    }
+
+    fileprivate func publishAccessibilityValue(from value: NSAttributedString) {
+        let accessibleValue = NSMutableAttributedString(attributedString: value)
+        var replacements: [(NSRange, String)] = []
+        accessibleValue.enumerateAttribute(
+            .kubecodeAccessibilityReplacement,
+            in: NSRange(location: 0, length: accessibleValue.length)
+        ) { replacement, range, _ in
+            if let replacement = replacement as? String {
+                replacements.append((range, replacement))
+            }
+        }
+        for (range, replacement) in replacements.reversed() {
+            accessibleValue.replaceCharacters(in: range, with: replacement)
+        }
+        publishedAccessibilityValue = accessibleValue.string
+    }
+
+    private func updateAccessibilityCustomActions() {
+        guard copyResponseSource?.isEmpty == false else {
+            setAccessibilityCustomActions([])
+            return
+        }
+        let action = NSAccessibilityCustomAction(
+            name: String(localized: "Copy Response"),
+            handler: { [weak self] in self?.copyResponseToPasteboard() ?? false }
+        )
+        setAccessibilityCustomActions([action])
     }
 }
 
@@ -213,6 +276,7 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         ) {
             latestPreparedCommit = commit
             let result = NativeMarkdownSuffixApplier.apply(commit, to: textView)
+            textView.publishAccessibilityValue(from: commit.attributedValue)
             if result != .unchanged { preparedApplyCount += 1 }
             measuredSource = commit.source
             measuredWidth = nil
@@ -760,7 +824,14 @@ enum NativeAgentMarkdownRenderer {
             width: floor(sourceSize.width * scale),
             height: floor(sourceSize.height * scale)
         )
-        return NSAttributedString(attachment: attachment)
+        let rendered = NSMutableAttributedString(attachment: attachment)
+        let label = source.alt.isEmpty ? String(localized: "Image") : source.alt
+        rendered.addAttribute(
+            .kubecodeAccessibilityReplacement,
+            value: label,
+            range: NSRange(location: 0, length: rendered.length)
+        )
+        return rendered
     }
 
     private static func imagePlaceholder(
@@ -776,6 +847,11 @@ enum NativeAgentMarkdownRenderer {
         )
         symbol.bounds = CGRect(x: 0, y: -2, width: font.pointSize + 2, height: font.pointSize + 2)
         let result = NSMutableAttributedString(attachment: symbol)
+        result.addAttribute(
+            .kubecodeAccessibilityReplacement,
+            value: "",
+            range: NSRange(location: 0, length: result.length)
+        )
         result.append(NSAttributedString(
             string: " \(label)",
             attributes: attributes(font: font, color: color(for: tone))
@@ -825,6 +901,11 @@ enum NativeAgentMarkdownRenderer {
         let rendered = NSMutableAttributedString(attachment: attachment)
         rendered.addAttribute(
             .kubecodeMathSource,
+            value: source,
+            range: NSRange(location: 0, length: rendered.length)
+        )
+        rendered.addAttribute(
+            .kubecodeAccessibilityReplacement,
             value: source,
             range: NSRange(location: 0, length: rendered.length)
         )

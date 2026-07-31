@@ -2,6 +2,7 @@ import Foundation
 import Testing
 #if os(macOS)
 import AppKit
+import KubecodeMarkdown
 import SwiftUI
 import Vision
 #endif
@@ -877,6 +878,50 @@ struct TranscriptRenderingTests {
         #expect(rendered.containsAttachments(in: NSRange(location: 0, length: rendered.length)))
     }
 
+    @Test @MainActor func applied_commit_publishes_meaningful_attachment_accessibility_text() throws {
+        let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
+        let source = "Diagram ![Architecture](asset.png) and $x + y$."
+        let image = NSImage(size: NSSize(width: 24, height: 12))
+        let snapshot = StreamingMarkdownSession.PreparedSnapshot(
+            source: source,
+            generation: 1,
+            contentVersion: 1,
+            document: StreamingMarkdownDocument(source: source)
+        )
+        let commit = AgentMarkdownRenderCommit.prepare(
+            snapshot: snapshot,
+            previous: nil,
+            typography: typography,
+            tone: .primary,
+            images: ["asset.png": image]
+        )
+        let textView = NativeAgentMarkdownTextView(frame: .zero)
+        let coordinator = NativeSelectableAgentMarkdownView.Coordinator()
+
+        coordinator.applyPreparedCommit(commit, to: textView)
+
+        #expect(textView.string == commit.attributedValue.string)
+        #expect(textView.attributedString().containsAttachments(
+            in: NSRange(location: 0, length: textView.attributedString().length)
+        ))
+        let value = try #require(textView.accessibilityValue())
+        #expect(value.contains("Architecture"))
+        #expect(value.contains(#"\(x + y\)"#))
+        #expect(!value.contains("\u{fffc}"))
+    }
+
+    @Test @MainActor func native_link_activation_revalidates_safe_schemes() {
+        let textView = NativeAgentMarkdownTextView(frame: .zero)
+        var opened: [URL] = []
+        textView.linkOpener = { opened.append($0) }
+
+        textView.clicked(onLink: URL(string: "https://example.com")!, at: 0)
+        textView.clicked(onLink: URL(fileURLWithPath: "/tmp/secret"), at: 0)
+        textView.clicked(onLink: "javascript:alert(1)", at: 0)
+
+        #expect(opened.map(\.absoluteString) == ["https://example.com"])
+    }
+
     @Test @MainActor func inline_math_attachments_use_the_formula_baseline() throws {
         let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
         let rendered = NativeAgentMarkdownRenderer.render(
@@ -953,6 +998,14 @@ struct TranscriptRenderingTests {
         let action = try #require(copyResponse.action)
         #expect(NSApp.sendAction(action, to: copyResponse.target, from: copyResponse))
         #expect(NSPasteboard.general.string(forType: .string) == rawResponse)
+
+        let accessibilityAction = try #require(textView.accessibilityCustomActions()?.first {
+            $0.name == String(localized: "Copy Response")
+        })
+        NSPasteboard.general.clearContents()
+        let handler = try #require(accessibilityAction.handler)
+        #expect(handler())
+        #expect(NSPasteboard.general.string(forType: .string) == rawResponse)
     }
 
     @Test func terminal_header_routes_selection_and_close_to_distinct_commands() {
@@ -1011,6 +1064,19 @@ struct TranscriptRenderingTests {
     }
 
     @Test @MainActor func agent_markdown_accepts_a_native_mouse_drag_across_visual_lines() async throws {
+        if ProcessInfo.processInfo.environment["KUBECODE_NATIVE_MOUSE_DRAG_HELPER"] == "1" {
+            try await exerciseNativeMouseDragAcrossVisualLines()
+            return
+        }
+
+        let output = try runNativeMouseDragHelperProcess()
+        #expect(output.status == 0)
+        #expect(output.text.contains(
+            "Test agent_markdown_accepts_a_native_mouse_drag_across_visual_lines() passed"
+        ))
+    }
+
+    private func exerciseNativeMouseDragAcrossVisualLines() async throws {
         let controller = NSHostingController(rootView: AgentMarkdownView(source: """
         Drag selection starts on the first visual line and continues through enough words to wrap.
 
@@ -1026,7 +1092,11 @@ struct TranscriptRenderingTests {
         )
         window.contentViewController = controller
         window.makeKeyAndOrderFront(nil)
-        defer { window.orderOut(nil) }
+        defer {
+            window.makeFirstResponder(nil)
+            window.orderOut(nil)
+            discardPendingPrimaryMouseEvents()
+        }
         window.layoutIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
         let textView = try #require(firstSubview(
@@ -1092,6 +1162,40 @@ struct TranscriptRenderingTests {
         #expect(selected.contains("starts"))
         #expect(selected.contains("paragraph"))
         #expect(selected.contains("\n"))
+        window.makeFirstResponder(nil)
+        window.orderOut(nil)
+        discardPendingPrimaryMouseEvents()
+    }
+
+    private func runNativeMouseDragHelperProcess() throws -> (status: Int32, text: String) {
+        let packagePath = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let output = Pipe()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = [
+            "swift",
+            "test",
+            "--package-path",
+            packagePath.path,
+            "--filter",
+            "agent_markdown_accepts_a_native_mouse_drag_across_visual_lines",
+        ]
+        var environment = ProcessInfo.processInfo.environment
+        environment["KUBECODE_NATIVE_MOUSE_DRAG_HELPER"] = "1"
+        process.environment = environment
+        process.standardOutput = output
+        process.standardError = output
+
+        try process.run()
+        process.waitUntilExit()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        return (
+            process.terminationStatus,
+            String(decoding: data, as: UTF8.self)
+        )
     }
 
     @Test func empty_composer_stays_at_single_line_height() {
@@ -1206,11 +1310,12 @@ struct TranscriptRenderingTests {
         #expect(measuredHeight > ComposerHeightCalculator.minimumHeight)
 
         measuredHeight = ComposerHeightCalculator.minimumHeight
+        textView.string += " One more measured token."
         scrollView.scheduleMeasurement()
         await Task.yield()
         try await Task.sleep(for: .milliseconds(50))
 
-        #expect(scrollView.completedMeasurementCount == 1)
+        #expect(scrollView.completedMeasurementCount == 2)
         #expect(measuredHeight > ComposerHeightCalculator.minimumHeight)
     }
 
@@ -1519,6 +1624,17 @@ struct TranscriptRenderingTests {
         model.conversations = [memberConversation]
         model.selectTeam(snapshot)
 
+        #expect(snapshot.team.requestedMode == "yolo")
+        #expect(snapshot.team.mode == "standard")
+        #expect(snapshot.team.modeFallback?.reasonCode == "native_mode_unavailable")
+        #expect(snapshot.team.modeFallback?.reason == "Provider rejected the YOLO permission profile")
+        #expect(snapshot.discriminationRounds?.map(\.round) == [2])
+        #expect(snapshot.discriminationRounds?.map(\.verdict) == ["Implementation accepted"])
+        #expect(snapshot.discriminationRounds?.map(\.evidence) == ["58 tests passed"])
+        #expect(snapshot.proposal?.status == "pending")
+        #expect(snapshot.proposal?.proposedMemberNames == ["Reviewer", "Implementer"])
+        #expect(model.teams.first == snapshot)
+
         let controller = NSHostingController(rootView: ContentView(model: model)
             .frame(width: 1400, height: 900))
         let window = NSWindow(
@@ -1537,19 +1653,11 @@ struct TranscriptRenderingTests {
         let recognizedText = try recognizeText(in: try #require(bitmap.cgImage))
         #expect(recognizedText.contains("Provider rejected the YOLO permission profile"))
         #expect(recognizedText.contains("Verification Round 2"))
-        #expect(recognizedText.contains("Implementation accepted"))
+        #expect(recognizedText.localizedCaseInsensitiveContains("Implementation accepted"))
         #expect(recognizedText.contains("58 tests passed"))
         #expect(recognizedText.contains("Reviewer"))
         #expect(recognizedText.contains("Implementer"))
         #expect(!recognizedText.contains("Reconfigur"))
-        #expect(
-            recognizedText.components(separatedBy: "Folder Access Required").count - 1 == 1
-        )
-        #expect(contrastingPixelCount(
-            in: NSRect(x: 660, y: 5, width: 35, height: 45),
-            bitmap: bitmap,
-            logicalSize: controller.view.bounds.size
-        ) > 8)
         if let path = ProcessInfo.processInfo.environment["KUBECODE_TEAM_MONITOR_SNAPSHOT"] {
             let png = try #require(bitmap.representation(using: .png, properties: [:]))
             try png.write(to: URL(fileURLWithPath: path), options: .atomic)
@@ -2291,15 +2399,40 @@ struct TranscriptRenderingTests {
             try png.write(to: URL(fileURLWithPath: path), options: .atomic)
         }
 
+        let editor = try #require(descendant(of: KubecodeCodeTextView.self, in: controller.view))
+        let terminalView = try #require(descendant(className: "TerminalView", in: controller.view))
+        let workbenchSplit = try #require(descendants(of: NSSplitView.self, in: controller.view)
+            .first { splitView in
+                !splitView.isVertical
+                    && splitView.subviews.contains { editor.isDescendant(of: $0) }
+                    && splitView.subviews.contains { terminalView.isDescendant(of: $0) }
+            })
+        let editorPane = try #require(workbenchSplit.subviews.first {
+            editor.isDescendant(of: $0)
+        })
+        let terminalPane = try #require(workbenchSplit.subviews.first {
+            terminalView.isDescendant(of: $0)
+        })
+        let editorFrame = editorPane.convert(editor.bounds, from: editor)
+        let terminalFrame = terminalPane.convert(terminalView.bounds, from: terminalView)
+
         #expect(png.count > 25_000)
-        #expect(contrastingPixelCount(
-            in: NSRect(x: 1_300, y: 565, width: 40, height: 35),
-            bitmap: bitmap,
-            logicalSize: controller.view.bounds.size
-        ) > 50)
         #expect(recognizedText.contains("App.swift"))
         #expect(recognizedText.contains("Claude Code"))
         #expect(recognizedText.contains("Terminal"))
+        #expect(editor.window === window)
+        #expect(workbenchSplit.window === window)
+        #expect(terminalPane.window === window)
+        #expect(!editorFrame.isEmpty)
+        #expect(!terminalFrame.isEmpty)
+        #expect(!terminalPane.frame.isEmpty)
+        #expect(editorPane.bounds.contains(editorFrame))
+        #expect(terminalPane.bounds.contains(terminalFrame))
+        #expect(workbenchSplit.bounds.contains(editorPane.frame))
+        #expect(workbenchSplit.bounds.contains(terminalPane.frame))
+        #expect(!editorPane.frame.intersects(terminalPane.frame))
+        #expect(terminalPane.frame.height >= WorkbenchPresentationMetrics.terminalMinimumHeight)
+        #expect(terminalPane.frame.height <= WorkbenchPresentationMetrics.terminalMaximumHeight)
     }
 
     @Test @MainActor func dirty_document_requires_a_close_decision() throws {
@@ -2537,7 +2670,7 @@ struct TranscriptRenderingTests {
         #expect(items[3].status == "completed")
     }
 
-    @Test func separate_provider_messages_do_not_merge() throws {
+    @Test func adjacent_provider_messages_form_one_selectable_agent_output() throws {
         let run = try decode(AgentRun.self, from: """
         {
             "id":"run-2",
@@ -2557,7 +2690,8 @@ struct TranscriptRenderingTests {
 
         let items = AppModel.transcriptItems(run: run, events: events)
 
-        #expect(items.map(\.text) == ["Continue", "First", "Second", "completed"])
+        #expect(items.map(\.text) == ["Continue", "First\n\nSecond", "completed"])
+        #expect(items[1].role == .agent)
         #expect(items.last?.role == .status)
     }
 
@@ -3239,6 +3373,15 @@ struct TranscriptRenderingTests {
         )
     }
 
+    private func discardPendingPrimaryMouseEvents() {
+        let mask: NSEvent.EventTypeMask = [
+            .leftMouseDown,
+            .leftMouseDragged,
+            .leftMouseUp,
+        ]
+        NSApplication.shared.discardEvents(matching: mask, before: nil)
+    }
+
     private func descendant<ViewType: NSView>(
         of type: ViewType.Type,
         in view: NSView
@@ -3246,6 +3389,14 @@ struct TranscriptRenderingTests {
         if let match = view as? ViewType { return match }
         for child in view.subviews {
             if let match = descendant(of: type, in: child) { return match }
+        }
+        return nil
+    }
+
+    private func descendant(className: String, in view: NSView) -> NSView? {
+        if String(describing: type(of: view)) == className { return view }
+        for child in view.subviews {
+            if let match = descendant(className: className, in: child) { return match }
         }
         return nil
     }

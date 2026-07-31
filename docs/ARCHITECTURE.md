@@ -110,16 +110,34 @@ and attachment generation. Independent render-request tokens reject stale
 same-snapshot style/resource jobs, and stable attributed prefixes cross only
 exactly compatible appearance/resource inputs. The collection accepts a newer
 publication, or the same publication at a newly current width, but never an
-older tuple. It remeasures only that row in the pending target without replacing
-its host. The scalar publication enters the collection's serialized geometry
-layer; it never invalidates visible layout independently.
+older tuple. That publication lower bound survives an outer-row-width-only
+change for the same item, content revision, and Session, while exact current
+outer provenance and the inner Markdown measurement width remain independent
+guards. It remeasures only that row in the pending target without replacing its
+host. The scalar publication enters the collection's serialized geometry layer;
+it never invalidates visible layout independently.
 Credential-free HTTPS images use the bounded ephemeral image loader; validated
 relative image paths use `RuntimeClient.readAsset` with the current Project ID.
-The row store coalesces attachment work and publishes at most one newer render
-and height generation for a matching changed settlement. That scalar settlement
-uses the same item/height/inset/width collection transaction as source growth.
+Each distinct source, typography, tone, appearance, or Project-resource request
+synchronously advances a row attachment epoch and cancels obsolete work before
+the replacement render may publish. Phase-only duplicates retain the active
+request. Selected-Project `file_changed` events carry only a deduplicated event
+ID and validated relative path into the window Session render store, which
+refreshes matching local-image rows while leaving unrelated and remote images
+untouched. The row store publishes at most one newer render and height generation
+for a matching changed settlement. That scalar settlement uses the same
+item/height/inset/width collection transaction as source growth.
 Read-only Agent output disables spelling correction, text replacement, and
 smart punctuation.
+
+Image alt labels and source-preserving math delimiters are attributed into the
+same immutable commit and projected as the native text view's accessibility
+value without mutating visible storage. Selection copy uses those replacements;
+Copy Response exposes the exact raw Markdown through both its context menu and
+an accessibility custom action. Link projection and native activation both
+allow only HTTP, HTTPS, and mailto destinations. The persistent view retains
+selection and first responder across streaming, completion, attachment, and
+appearance refreshes.
 One MainActor geometry driver retains one in-flight transaction and one
 replaceable latest full intent. It premeasures every target row, then commits the
 item projection, persistent row-builder configuration, scalar sizes, rounded
