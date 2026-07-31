@@ -2891,6 +2891,78 @@ struct TranscriptRenderingTests {
         #expect(output.text == "Found it")
     }
 
+    @Test func working_details_use_one_stable_row_and_semantic_child_identity() {
+        let original = TranscriptRunActivity(
+            runID: "run-1",
+            items: [
+                TranscriptItem(id: "thinking-a", role: .thinking, text: "Inspect"),
+                TranscriptItem(id: "tool-a", role: .tool, text: "Read", detail: "A"),
+            ],
+            isActive: true,
+            status: nil
+        )
+        let prefixed = TranscriptRunActivity(
+            runID: "run-1",
+            items: [
+                TranscriptItem(id: "tool-prefix", role: .tool, text: "Prefix", detail: "P"),
+                TranscriptItem(id: "tool-a", role: .tool, text: "Read", detail: "A"),
+                TranscriptItem(id: "thinking-a", role: .thinking, text: "Inspect"),
+            ],
+            isActive: true,
+            status: nil
+        )
+
+        let first = TranscriptActivityDetailsPresentation(
+            activity: original,
+            showsAllSteps: true
+        )
+        let reordered = TranscriptActivityDetailsPresentation(
+            activity: prefixed,
+            showsAllSteps: true
+        )
+
+        #expect(first.id == "run-run-1-activity-details")
+        #expect(reordered.id == first.id)
+        #expect(first.steps.map(\.identity.id) == ["thinking:thinking-a", "tool:tool-a"])
+        #expect(reordered.steps.map(\.identity.id) == [
+            "tool:tool-prefix", "tool:tool-a", "thinking:thinking-a",
+        ])
+        #expect(first.steps[1].identity == reordered.steps[1].identity)
+        #expect(first.steps[0].identity == reordered.steps[2].identity)
+    }
+
+    @Test @MainActor func working_collapse_preserves_nested_semantic_state() {
+        let session = SessionWorkspaceModel()
+        let sessionID = "session-a"
+        let activityID = "run-run-1-activity"
+        let toolIdentity = TranscriptDisclosureIdentity(itemID: "tool-a", kind: .tool)
+
+        session.setTranscriptExpanded(
+            true,
+            sessionID: sessionID,
+            identity: toolIdentity,
+            ownerID: activityID
+        )
+        session.setTranscriptExpanded(
+            false,
+            sessionID: sessionID,
+            itemID: activityID,
+            ownerID: activityID
+        )
+        session.setTranscriptExpanded(
+            true,
+            sessionID: sessionID,
+            itemID: activityID,
+            ownerID: activityID
+        )
+
+        #expect(session.isTranscriptExpanded(sessionID: sessionID, identity: toolIdentity))
+        #expect(!session.isTranscriptExpanded(
+            sessionID: sessionID,
+            identity: .init(itemID: "tool-a", kind: .thinking)
+        ))
+    }
+
     @Test func activity_disclosure_follows_run_defaults_until_the_user_overrides_it() {
         var state = TranscriptActivityDisclosureState()
 
@@ -2902,6 +2974,141 @@ struct TranscriptRenderingTests {
 
         state.userSet(true)
         #expect(state.resolved(defaultExpanded: false))
+    }
+
+    @Test func collapsed_disclosures_never_wait_for_markdown_height() {
+        #expect(TranscriptSurfaceHeightAuthority.resolve(
+            role: .thinking,
+            presentation: .activityStep,
+            isExpanded: false
+        ) == .synchronousHosting)
+        #expect(TranscriptSurfaceHeightAuthority.resolve(
+            role: .tool,
+            presentation: .activityStep,
+            isExpanded: true
+        ) == .synchronousHosting)
+        #expect(TranscriptSurfaceHeightAuthority.resolve(
+            role: .thinking,
+            presentation: .activityStep,
+            isExpanded: true
+        ) == .versionedRender)
+    }
+
+    @Test @MainActor func repeated_tool_disclosure_keeps_chrome_and_releases_content() async throws {
+        let model = AppModel(connections: MacConnectionManager())
+        let session = SessionWorkspaceModel()
+        let project = try decode(Project.self, from: """
+        {"id":"project-1","name":"Kubecode","workspaces_enabled":false}
+        """)
+        let conversation = try decode(Conversation.self, from: """
+        {
+          "id":"session-1","project_id":"project-1","agent_id":"codex",
+          "title":"Tool Disclosure","execution_mode":"default","latest_run_status":"running"
+        }
+        """)
+        model.projects = [project]
+        model.selectedProjectID = project.id
+        model.conversations = [conversation]
+        model.selectedConversationID = conversation.id
+        model.runs = [try decode(AgentRun.self, from: """
+        {
+          "id":"run-1","conversation_id":"session-1","project_id":"project-1",
+          "message":"Inspect","status":"running","error":null,
+          "permission_mode":null,"internal":false
+        }
+        """)]
+        let output = String(repeating: "byte-exact output line\n", count: 80)
+        model.transcript = [
+            TranscriptItem(id: "user", role: .user, text: "Inspect", runID: "run-1"),
+            TranscriptItem(
+                id: "tool-a",
+                role: .tool,
+                text: "Run focused tests",
+                runID: "run-1",
+                detail: output,
+                status: "completed"
+            ),
+        ]
+        let activityID = "run-run-1-activity"
+        let detailsID = "\(activityID)-details"
+        let toolIdentity = TranscriptDisclosureIdentity(itemID: "tool-a", kind: .tool)
+        session.setTranscriptExpanded(
+            true,
+            sessionID: conversation.id,
+            itemID: activityID,
+            ownerID: activityID
+        )
+        session.setTranscriptExpanded(
+            true,
+            sessionID: conversation.id,
+            identity: toolIdentity,
+            ownerID: detailsID
+        )
+
+        let controller = NSHostingController(rootView: ContentView(
+            model: model,
+            sessionWorkspace: session
+        ).frame(width: 940, height: 680))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 940, height: 680),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        await settle(window: window, controller: controller)
+
+        let expandedHeight = try #require(descendant(
+            of: NativeBoundedTranscriptNSView.self,
+            in: controller.view
+        )).contentHeight
+        #expect(descendant(of: NativeToolOutputTextView.self, in: controller.view)?.string == output)
+
+        for _ in 0..<3 {
+            session.setTranscriptExpanded(
+                false,
+                sessionID: conversation.id,
+                identity: toolIdentity,
+                ownerID: detailsID
+            )
+            await settle(window: window, controller: controller)
+            #expect(descendant(of: NativeToolOutputTextView.self, in: controller.view) == nil)
+            let collapsedHeight = try #require(descendant(
+                of: NativeBoundedTranscriptNSView.self,
+                in: controller.view
+            )).contentHeight
+            #expect(collapsedHeight < expandedHeight)
+            let bitmap = try #require(NSBitmapImageRep(data: snapshot(controller.view)))
+            let recognized = try recognizeText(in: try #require(bitmap.cgImage))
+            #expect(recognized.contains("Run focused tests"))
+
+            session.setTranscriptExpanded(
+                true,
+                sessionID: conversation.id,
+                identity: toolIdentity,
+                ownerID: detailsID
+            )
+            await settle(window: window, controller: controller)
+            #expect(descendant(of: NativeToolOutputTextView.self, in: controller.view)?.string == output)
+        }
+
+        session.setTranscriptExpanded(
+            false,
+            sessionID: conversation.id,
+            itemID: activityID,
+            ownerID: activityID
+        )
+        session.setTranscriptExpanded(
+            true,
+            sessionID: conversation.id,
+            itemID: activityID,
+            ownerID: activityID
+        )
+        await settle(window: window, controller: controller)
+        #expect(session.isTranscriptExpanded(sessionID: conversation.id, identity: toolIdentity))
+        #expect(descendant(of: NativeToolOutputTextView.self, in: controller.view)?.string == output)
     }
 
     @Test @MainActor func activity_disclosure_remeasures_without_output_or_scroll() async throws {
@@ -2965,7 +3172,7 @@ struct TranscriptRenderingTests {
             of: NativeTranscriptCollectionNSView.self,
             in: controller.view
         ))
-        let collapsedHeight = collectionView.bounds.height
+        let collapsedHeight = collectionView.collectionViewLayout?.collectionViewContentSize.height ?? 0
         let collapsedItemCount = collectionView.numberOfItems(inSection: 0)
 
         session.setTranscriptExpanded(
@@ -2984,9 +3191,17 @@ struct TranscriptRenderingTests {
             of: NativeTranscriptCollectionNSView.self,
             in: controller.view
         ))
-        let expandedHeight = collectionView.bounds.height
+        let expandedHeight = collectionView.collectionViewLayout?.collectionViewContentSize.height ?? 0
         #expect(expandedHeight > collapsedHeight + 100)
-        #expect(collectionView.numberOfItems(inSection: 0) > collapsedItemCount + 30)
+        #expect(collectionView.numberOfItems(inSection: 0) == collapsedItemCount + 1)
+        let detailsFrame = try #require(collectionView.layoutAttributesForItem(
+            at: IndexPath(item: collapsedItemCount, section: 0)
+        )?.frame)
+        #expect(abs(detailsFrame.height - TranscriptDisclosureMetrics.workingMaximumHeight) < 1)
+        #expect(descendant(
+            of: NativeBoundedTranscriptNSView.self,
+            in: controller.view
+        )?.contentHeight ?? 0 > TranscriptDisclosureMetrics.workingMaximumHeight)
 
         session.setTranscriptExpanded(
             false,
@@ -2999,7 +3214,8 @@ struct TranscriptRenderingTests {
             of: NativeTranscriptCollectionNSView.self,
             in: controller.view
         ))
-        #expect(abs(collectionView.bounds.height - collapsedHeight) < 2)
+        let recollapsedHeight = collectionView.collectionViewLayout?.collectionViewContentSize.height ?? 0
+        #expect(abs(recollapsedHeight - collapsedHeight) < 2)
     }
 
     @Test @MainActor func transcript_follows_streaming_output_without_overriding_user_scroll() async throws {

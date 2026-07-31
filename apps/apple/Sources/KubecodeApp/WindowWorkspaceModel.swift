@@ -3,6 +3,26 @@ import Observation
 import KubecodeMacRuntime
 import KubecodeUI
 
+enum TranscriptDisclosureKind: String, Hashable, Sendable {
+    case thinking
+    case tool
+
+    init?(role: TranscriptRole) {
+        switch role {
+        case .thinking: self = .thinking
+        case .tool: self = .tool
+        case .user, .agent, .system, .status: return nil
+        }
+    }
+}
+
+struct TranscriptDisclosureIdentity: Identifiable, Hashable, Sendable {
+    let itemID: String
+    let kind: TranscriptDisclosureKind
+
+    var id: String { "\(kind.rawValue):\(itemID)" }
+}
+
 @MainActor
 @Observable
 final class SessionWorkspaceModel {
@@ -32,6 +52,13 @@ final class SessionWorkspaceModel {
         )
     }
 
+    func isTranscriptExpanded(
+        sessionID: String?,
+        identity: TranscriptDisclosureIdentity
+    ) -> Bool {
+        isTranscriptExpanded(sessionID: sessionID, itemID: identity.id)
+    }
+
     func resolvedTranscriptExpansion(
         sessionID: String?,
         itemID: String,
@@ -59,11 +86,30 @@ final class SessionWorkspaceModel {
         bumpTranscriptLayoutRevision(sessionID: sessionID, ownerID: ownerID ?? itemID)
     }
 
+    func setTranscriptExpanded(
+        _ expanded: Bool,
+        sessionID: String?,
+        identity: TranscriptDisclosureIdentity,
+        ownerID: String
+    ) {
+        setTranscriptExpanded(
+            expanded,
+            sessionID: sessionID,
+            itemID: identity.id,
+            ownerID: ownerID
+        )
+    }
+
     func showsAllTranscriptSteps(sessionID: String?, ownerID: String) -> Bool {
         transcriptShowsAllSteps.contains(transcriptLayoutKey(sessionID: sessionID, ownerID: ownerID))
     }
 
-    func setShowsAllTranscriptSteps(_ showsAll: Bool, sessionID: String?, ownerID: String) {
+    func setShowsAllTranscriptSteps(
+        _ showsAll: Bool,
+        sessionID: String?,
+        ownerID: String,
+        layoutOwnerID: String? = nil
+    ) {
         let key = transcriptLayoutKey(sessionID: sessionID, ownerID: ownerID)
         guard transcriptShowsAllSteps.contains(key) != showsAll else { return }
         if showsAll {
@@ -71,7 +117,10 @@ final class SessionWorkspaceModel {
         } else {
             transcriptShowsAllSteps.remove(key)
         }
-        bumpTranscriptLayoutRevision(sessionID: sessionID, ownerID: ownerID)
+        bumpTranscriptLayoutRevision(
+            sessionID: sessionID,
+            ownerID: layoutOwnerID ?? ownerID
+        )
     }
 
     func transcriptLayoutRevision(sessionID: String?, ownerID: String) -> Int {
