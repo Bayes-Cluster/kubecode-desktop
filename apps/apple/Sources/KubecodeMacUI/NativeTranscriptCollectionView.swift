@@ -12,6 +12,38 @@ public enum NativeTranscriptResizePolicy: Hashable, Sendable {
 }
 
 @MainActor
+public struct NativeTranscriptRowRenderContext {
+    public let itemID: String
+    public let contentRevision: Int
+    private let publishAction: (NativeTranscriptRenderHeightValue) -> Void
+
+    fileprivate init(
+        itemID: String,
+        contentRevision: Int,
+        publishAction: @escaping (NativeTranscriptRenderHeightValue) -> Void
+    ) {
+        self.itemID = itemID
+        self.contentRevision = contentRevision
+        self.publishAction = publishAction
+    }
+
+    public func publish(_ value: NativeTranscriptRenderHeightValue) {
+        publishAction(value)
+    }
+}
+
+private struct NativeTranscriptRowRenderContextKey: EnvironmentKey {
+    static let defaultValue: NativeTranscriptRowRenderContext? = nil
+}
+
+public extension EnvironmentValues {
+    var nativeTranscriptRowRenderContext: NativeTranscriptRowRenderContext? {
+        get { self[NativeTranscriptRowRenderContextKey.self] }
+        set { self[NativeTranscriptRowRenderContextKey.self] = newValue }
+    }
+}
+
+@MainActor
 private final class TranscriptHostingItem: NSCollectionViewItem {
     private let hostingView = NSHostingView(rootView: AnyView(EmptyView()))
 
@@ -206,6 +238,11 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
 
     @MainActor
     public final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegateFlowLayout {
+        private struct AcceptedRenderHeight {
+            let contentRevision: Int
+            let value: NativeTranscriptRenderHeightValue
+        }
+
         private var items: [NativeTranscriptItem]
         private var pendingItems: [NativeTranscriptItem]
         private var rowBuilder: (Int) -> AnyView
@@ -218,6 +255,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         private weak var collectionView: NativeTranscriptCollectionNSView?
         private let measurementHost = NSHostingView(rootView: AnyView(EmptyView()))
         private var heightCache = TranscriptHeightCache()
+        private var renderHeights: [String: AcceptedRenderHeight] = [:]
         private var layoutGate = TranscriptLayoutGate()
         private var pendingLayoutTask: Task<Void, Never>?
         private var finalWidthLayoutTask: Task<Void, Never>?
@@ -290,9 +328,11 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
 
             if changedSession {
                 heightCache.removeAll()
+                renderHeights.removeAll(keepingCapacity: true)
             } else if !updatePlan.reloadsAllItems {
                 for index in updatePlan.changedIndexes where parent.items.indices.contains(index) {
                     heightCache.remove(id: parent.items[index].id)
+                    renderHeights.removeValue(forKey: parent.items[index].id)
                 }
             }
             if initial || changedSession {
@@ -362,6 +402,11 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 id: item.id,
                 contentRevision: item.contentRevision,
                 layoutRevision: item.layoutRevision,
+                renderHeightRevision: renderHeights[item.id].flatMap { accepted in
+                    accepted.contentRevision == item.contentRevision
+                        ? accepted.value.key.renderPublicationVersion
+                        : nil
+                } ?? 0,
                 width: width
             )
             if let height = heightCache.height(for: key) {
@@ -395,11 +440,54 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         }
 
         private func rowContent(at index: Int, width: CGFloat) -> AnyView {
-            AnyView(
+            let context: NativeTranscriptRowRenderContext?
+            if items.indices.contains(index) {
+                let item = items[index]
+                context = NativeTranscriptRowRenderContext(
+                    itemID: item.id,
+                    contentRevision: item.contentRevision,
+                    publishAction: { [weak self] value in
+                        self?.acceptRenderHeight(
+                            value,
+                            itemID: item.id,
+                            contentRevision: item.contentRevision
+                        )
+                    }
+                )
+            } else {
+                context = nil
+            }
+            return AnyView(
                 rowBuilder(index)
                     .frame(width: width, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
+                    .environment(\.nativeTranscriptRowRenderContext, context)
             )
+        }
+
+        private func acceptRenderHeight(
+            _ value: NativeTranscriptRenderHeightValue,
+            itemID: String,
+            contentRevision: Int
+        ) {
+            guard let item = items.first(where: { $0.id == itemID }),
+                  value.isAcceptable(
+                    capturedContentRevision: contentRevision,
+                    currentContentRevision: item.contentRevision,
+                    previous: renderHeights[itemID].flatMap { accepted in
+                        accepted.contentRevision == item.contentRevision
+                            ? accepted.value
+                            : nil
+                    },
+                    effectiveWidth: availableWidth
+                  )
+            else { return }
+            renderHeights[itemID] = AcceptedRenderHeight(
+                contentRevision: contentRevision,
+                value: value
+            )
+            heightCache.remove(id: itemID)
+            collectionView?.collectionViewLayout?.invalidateLayout()
         }
 
         private func scheduleLayout(preserveAnchor: Bool) {

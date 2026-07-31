@@ -29,22 +29,79 @@ public struct TranscriptScrollGeometry: Equatable, Sendable {
     }
 }
 
+public struct NativeTranscriptRenderHeightKey: Hashable, Sendable {
+    public let contentVersion: Int
+    public let renderPublicationVersion: Int
+    public let effectiveWidth: CGFloat
+
+    public init(
+        contentVersion: Int,
+        renderPublicationVersion: Int,
+        effectiveWidth: CGFloat
+    ) {
+        self.contentVersion = contentVersion
+        self.renderPublicationVersion = renderPublicationVersion
+        self.effectiveWidth = max(effectiveWidth, 1).rounded(.toNearestOrAwayFromZero)
+    }
+}
+
+public struct NativeTranscriptRenderHeightValue: Hashable, Sendable {
+    public let key: NativeTranscriptRenderHeightKey
+    public let height: CGFloat
+
+    public init(key: NativeTranscriptRenderHeightKey, height: CGFloat) {
+        self.key = key
+        self.height = max(1, height)
+    }
+
+    public func isStrictlyNewer(
+        than previous: NativeTranscriptRenderHeightValue?,
+        effectiveWidth: CGFloat
+    ) -> Bool {
+        let width = max(effectiveWidth, 1).rounded(.toNearestOrAwayFromZero)
+        guard key.effectiveWidth == width else { return false }
+        guard let previous else { return true }
+        let isNewerPublication = key.contentVersion > previous.key.contentVersion
+            || (key.contentVersion == previous.key.contentVersion
+                && key.renderPublicationVersion > previous.key.renderPublicationVersion)
+        let isSamePublication = key.contentVersion == previous.key.contentVersion
+            && key.renderPublicationVersion == previous.key.renderPublicationVersion
+        if previous.key.effectiveWidth == width {
+            return isNewerPublication
+        }
+        return isNewerPublication || isSamePublication
+    }
+
+    public func isAcceptable(
+        capturedContentRevision: Int,
+        currentContentRevision: Int,
+        previous: NativeTranscriptRenderHeightValue?,
+        effectiveWidth: CGFloat
+    ) -> Bool {
+        capturedContentRevision == currentContentRevision
+            && isStrictlyNewer(than: previous, effectiveWidth: effectiveWidth)
+    }
+}
+
 public struct TranscriptHeightCache: Sendable {
     public struct Key: Hashable, Sendable {
         public let id: String
         public let contentRevision: Int
         public let layoutRevision: Int
+        public let renderHeightRevision: Int
         public let width: CGFloat
 
         public init(
             id: String,
             contentRevision: Int,
             layoutRevision: Int = 0,
+            renderHeightRevision: Int = 0,
             width: CGFloat
         ) {
             self.id = id
             self.contentRevision = contentRevision
             self.layoutRevision = layoutRevision
+            self.renderHeightRevision = renderHeightRevision
             self.width = width.rounded(.toNearestOrAwayFromZero)
         }
     }

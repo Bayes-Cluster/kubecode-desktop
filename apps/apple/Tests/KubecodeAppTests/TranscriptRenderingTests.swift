@@ -24,6 +24,51 @@ private final class ApplicationConnectionOwnershipSpy: ApplicationConnectionOwne
 @Suite(.serialized)
 @MainActor
 struct TranscriptRenderingTests {
+    @Test func transcript_height_cache_keys_the_accepted_render_height_revision() {
+        let first = TranscriptHeightCache.Key(
+            id: "row",
+            contentRevision: 1,
+            layoutRevision: 0,
+            renderHeightRevision: 1,
+            width: 400
+        )
+        let latest = TranscriptHeightCache.Key(
+            id: "row",
+            contentRevision: 1,
+            layoutRevision: 0,
+            renderHeightRevision: 2,
+            width: 400
+        )
+
+        #expect(first != latest)
+        #expect(first.width == 400)
+    }
+
+    @Test func transcript_render_height_acceptance_orders_publication_before_width() {
+        let original = NativeTranscriptRenderHeightValue(
+            key: .init(contentVersion: 3, renderPublicationVersion: 8, effectiveWidth: 400),
+            height: 80
+        )
+        let samePublicationNewWidth = NativeTranscriptRenderHeightValue(
+            key: .init(contentVersion: 3, renderPublicationVersion: 8, effectiveWidth: 600),
+            height: 64
+        )
+        let lowerPublicationNewWidth = NativeTranscriptRenderHeightValue(
+            key: .init(contentVersion: 3, renderPublicationVersion: 7, effectiveWidth: 700),
+            height: 60
+        )
+
+        #expect(samePublicationNewWidth.isStrictlyNewer(than: original, effectiveWidth: 600))
+        #expect(!samePublicationNewWidth.isStrictlyNewer(
+            than: samePublicationNewWidth,
+            effectiveWidth: 600
+        ))
+        #expect(!lowerPublicationNewWidth.isStrictlyNewer(
+            than: samePublicationNewWidth,
+            effectiveWidth: 700
+        ))
+        #expect(!samePublicationNewWidth.isStrictlyNewer(than: original, effectiveWidth: 700))
+    }
     @Test func transcript_tail_geometry_includes_the_composer_obstruction() {
         let geometry = TranscriptScrollGeometry(
             documentHeight: 1_200,

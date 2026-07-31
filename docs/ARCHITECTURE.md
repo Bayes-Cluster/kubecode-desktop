@@ -101,13 +101,23 @@ streaming snapshots remains the explicit scope of Issue #7.
 Each native message coordinator applies prepared render commits keyed by source,
 typography, tone, and Project resource identity. `sizeThatFits` consumes only a
 matching prepared commit and never synchronously parses Markdown.
+
+Transcript Markdown rows share a MainActor render store across visible and
+hidden hosts. An exact versioned render-height commit couples the visible
+prepared attributed value to detached TextKit `usedRect` geometry using the
+same rounded width, typography, appearance, tone, Project resource generation,
+and attachment generation. Independent render-request tokens reject stale
+same-snapshot style/resource jobs, and stable attributed prefixes cross only
+exactly compatible appearance/resource inputs. The collection accepts a newer
+publication, or the same publication at a newly current width, but never an
+older tuple; it invalidates only that row's cache without replacing its host.
+Collection transaction serialization and viewport policy remain a separate
+geometry layer.
 Credential-free HTTPS images use the bounded ephemeral image loader; validated
 relative image paths use `RuntimeClient.readAsset` with the current Project ID.
-The current collection still caches scalar row heights independently from
-asynchronously prepared and attachment-settled render commits. Making visible
-content and height one authoritative versioned commit remains the explicit
-scope of Issue #6; this layer does not claim authoritative height, attachment
-settlement height, follow-tail stability, anchor stability, or atomic geometry.
+The row store coalesces attachment work and publishes at most one newer render
+and height generation for a matching changed settlement. This layer does not
+claim follow-tail stability, anchor stability, or atomic collection geometry.
 Read-only Agent output disables spelling correction, text replacement, and
 smart punctuation.
 Stable insertions, deletions, and row reloads use one nonanimated collection

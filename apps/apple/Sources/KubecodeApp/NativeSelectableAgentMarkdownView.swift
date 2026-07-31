@@ -2,7 +2,7 @@ import AppKit
 import KubecodeMarkdown
 import SwiftUI
 
-enum AgentMarkdownTone: Equatable {
+enum AgentMarkdownTone: Equatable, Hashable {
     case primary
     case secondary
 }
@@ -113,6 +113,9 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
     let isStreaming: Bool
     let resourceContext: MarkdownProjectResourceContext?
     let preparedCommit: AgentMarkdownRenderCommit?
+    let renderStore: AgentMarkdownRenderStore?
+    let renderRowID: String?
+    let onRenderHeight: ((AgentMarkdownRenderHeightCommit) -> Void)?
 
     init(
         source: String,
@@ -121,7 +124,10 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         copyResponseSource: String?,
         isStreaming: Bool = false,
         resourceContext: MarkdownProjectResourceContext? = nil,
-        preparedCommit: AgentMarkdownRenderCommit? = nil
+        preparedCommit: AgentMarkdownRenderCommit? = nil,
+        renderStore: AgentMarkdownRenderStore? = nil,
+        renderRowID: String? = nil,
+        onRenderHeight: ((AgentMarkdownRenderHeightCommit) -> Void)? = nil
     ) {
         self.source = source
         self.typography = typography
@@ -130,6 +136,9 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         self.isStreaming = isStreaming
         self.resourceContext = resourceContext
         self.preparedCommit = preparedCommit
+        self.renderStore = renderStore
+        self.renderRowID = renderRowID
+        self.onRenderHeight = onRenderHeight
     }
 
     @MainActor
@@ -141,7 +150,6 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         private var measuredHeight: CGFloat?
         private var measuredSource: String?
         private var measuredResourceIdentity: String?
-        private var imageTask: Task<Void, Never>?
         private(set) var renderCount = 0
         private(set) var applyCount = 0
         private(set) var preparedRenderCount = 0
@@ -181,27 +189,22 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         func receivePreparedCommit(
             _ commit: AgentMarkdownRenderCommit,
             resourceContext: MarkdownProjectResourceContext? = nil,
+            isAuthoritative: Bool = false,
             to textView: NativeAgentMarkdownTextView
         ) {
             if let latestPreparedCommit,
                latestPreparedCommit.contentVersion > commit.contentVersion
                 || (latestPreparedCommit.contentVersion == commit.contentVersion
-                    && latestPreparedCommit.generation >= commit.generation)
+                    && latestPreparedCommit.generation > commit.generation)
+                || latestPreparedCommit === commit
             {
                 return
             }
-            imageTask?.cancel()
-            imageTask = nil
             preparedRenderCount += 1
-            let commitToApply = latestPreparedCommit.map {
-                commit.carryingStablePrefix(from: $0)
-            } ?? commit
+            let commitToApply = isAuthoritative
+                ? commit
+                : latestPreparedCommit.map { commit.carryingStablePrefix(from: $0) } ?? commit
             applyPreparedCommit(commitToApply, to: textView)
-            loadImages(
-                for: commitToApply,
-                resourceContext: resourceContext,
-                textView: textView
-            )
         }
 
         func applyPreparedCommit(
@@ -220,62 +223,6 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         func measurementCommit(forSource source: String) -> AgentMarkdownRenderCommit? {
             guard latestPreparedCommit?.source == source else { return nil }
             return latestPreparedCommit
-        }
-
-        private func loadImages(
-            for commit: AgentMarkdownRenderCommit,
-            resourceContext: MarkdownProjectResourceContext?,
-            textView: NativeAgentMarkdownTextView
-        ) {
-            let loads = commit.document.imageLoads
-            guard !loads.isEmpty else { return }
-            imageTask = Task { @MainActor [weak self, weak textView] in
-                let loaded = await withTaskGroup(
-                    of: (String, Data?).self,
-                    returning: [(String, Data?)].self
-                ) { group in
-                    for load in loads {
-                        group.addTask {
-                            if let url = load.remoteURL {
-                                return (
-                                    load.source,
-                                    await MarkdownRemoteImageLoader.shared.data(for: url)
-                                )
-                            }
-                            if let path = load.projectPath, let resourceContext {
-                                return (load.source, await resourceContext.data(for: path))
-                            }
-                            return (load.source, nil)
-                        }
-                    }
-                    var values: [(String, Data?)] = []
-                    for await value in group { values.append(value) }
-                    return values
-                }
-                guard let self, let textView, !Task.isCancelled,
-                      self.latestPreparedCommit === commit
-                else { return }
-                let pairs: [(String, NSImage)] = loaded.compactMap { source, data in
-                    guard let data, let image = MarkdownRemoteImageDecoder.image(from: data) else { return nil }
-                    return (source, image)
-                }
-                var images: [String: NSImage] = [:]
-                for (source, image) in pairs { images[source] = image }
-                guard !images.isEmpty else {
-                    self.imageTask = nil
-                    return
-                }
-                let imageCommit = AgentMarkdownRenderCommit.prepare(
-                    snapshot: commit.snapshot,
-                    previous: commit,
-                    typography: commit.typography,
-                    tone: commit.tone,
-                    images: images
-                )
-                self.preparedRenderCount += 1
-                self.applyPreparedCommit(imageCommit, to: textView)
-                self.imageTask = nil
-            }
         }
 
         func renderedUpdate(
@@ -369,20 +316,19 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
             source: source,
             resourceIdentity: resourceContext?.identity
         )
-        guard let commit = context.coordinator.measurementCommit(forSource: source) else {
+        guard context.coordinator.measurementCommit(forSource: source) != nil,
+              let renderStore,
+              let renderRowID,
+              let measured = renderStore.heightCommit(
+                rowID: renderRowID,
+                width: width,
+                verticalInset: textView.textContainerInset.height
+              )
+        else {
             return nil
         }
-        if let height = context.coordinator.cachedHeight(for: width) {
-            return CGSize(width: width, height: height)
-        }
-        let resolvedHeight = NativeAgentMarkdownMeasurement.height(
-            for: commit.attributedValue,
-            width: width,
-            minimumHeight: commit.typography.pointSize + 2,
-            verticalInset: textView.textContainerInset.height
-        )
-        context.coordinator.cacheHeight(resolvedHeight, for: width)
-        return CGSize(width: width, height: resolvedHeight)
+        onRenderHeight?(measured)
+        return CGSize(width: measured.key.effectiveWidth, height: measured.height)
     }
 
     private func update(
@@ -394,23 +340,54 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         coordinator.receivePreparedCommit(
             preparedCommit,
             resourceContext: resourceContext,
+            isAuthoritative: renderStore != nil,
             to: textView
         )
     }
 }
 
 enum NativeAgentMarkdownMeasurement {
+    struct Result {
+        let usedRect: NSRect
+        let height: CGFloat
+    }
+
+    static func measure(
+        rendered: NSAttributedString,
+        width: CGFloat,
+        minimumHeight: CGFloat,
+        verticalInset: CGFloat
+    ) -> Result {
+        let textStorage = NSTextStorage(attributedString: rendered)
+        let layoutManager = NSLayoutManager()
+        layoutManager.usesFontLeading = true
+        let textContainer = NSTextContainer(size: NSSize(
+            width: max(width, 1).rounded(.toNearestOrAwayFromZero),
+            height: .greatestFiniteMagnitude
+        ))
+        textContainer.lineFragmentPadding = 0
+        layoutManager.addTextContainer(textContainer)
+        textStorage.addLayoutManager(layoutManager)
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        return Result(
+            usedRect: usedRect,
+            height: max(ceil(usedRect.maxY) + verticalInset * 2, minimumHeight)
+        )
+    }
+
     static func height(
         for rendered: NSAttributedString,
         width: CGFloat,
         minimumHeight: CGFloat,
         verticalInset: CGFloat
     ) -> CGFloat {
-        let bounds = rendered.boundingRect(
-            with: NSSize(width: max(width, 1), height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]
-        )
-        return max(ceil(bounds.height) + verticalInset * 2, minimumHeight)
+        measure(
+            rendered: rendered,
+            width: width,
+            minimumHeight: minimumHeight,
+            verticalInset: verticalInset
+        ).height
     }
 }
 

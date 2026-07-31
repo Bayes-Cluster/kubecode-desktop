@@ -16,6 +16,9 @@ final class AgentMarkdownRenderCommit {
     let snapshot: StreamingMarkdownSession.PreparedSnapshot
     let typography: WorkspaceTypography
     let tone: AgentMarkdownTone
+    let styleRevision: Int
+    let resourceIdentity: String?
+    let resourceGeneration: Int
     let document: AgentMarkdownDocument
     let blocks: [Block]
     let attributedValue: NSAttributedString
@@ -36,7 +39,10 @@ final class AgentMarkdownRenderCommit {
         previous: AgentMarkdownRenderCommit?,
         typography: WorkspaceTypography,
         tone: AgentMarkdownTone,
-        images: [String: NSImage] = [:]
+        images: [String: NSImage] = [:],
+        styleRevision: Int = 0,
+        resourceIdentity: String? = nil,
+        resourceGeneration: Int = 0
     ) -> AgentMarkdownRenderCommit {
         let document = AgentMarkdownDocument(streamingDocument: snapshot.document)
         let reusablePrefixCount = safeReusablePrefixCount(
@@ -44,7 +50,10 @@ final class AgentMarkdownRenderCommit {
             document: document,
             previous: previous,
             typography: typography,
-            tone: tone
+            tone: tone,
+            styleRevision: styleRevision,
+            resourceIdentity: resourceIdentity,
+            resourceGeneration: resourceGeneration
         )
         var values: [NSAttributedString] = []
         values.reserveCapacity(document.preparedBlocks.count)
@@ -76,7 +85,10 @@ final class AgentMarkdownRenderCommit {
             document: document,
             values: values,
             previous: previous,
-            reusablePrefixCount: reusablePrefixCount
+            reusablePrefixCount: reusablePrefixCount,
+            styleRevision: styleRevision,
+            resourceIdentity: resourceIdentity,
+            resourceGeneration: resourceGeneration
         )
     }
 
@@ -88,7 +100,10 @@ final class AgentMarkdownRenderCommit {
             document: document,
             previous: currentlyApplied,
             typography: typography,
-            tone: tone
+            tone: tone,
+            styleRevision: styleRevision,
+            resourceIdentity: resourceIdentity,
+            resourceGeneration: resourceGeneration
         )
         guard reusablePrefixCount > 0 else { return self }
 
@@ -103,7 +118,10 @@ final class AgentMarkdownRenderCommit {
             document: document,
             values: values,
             previous: currentlyApplied,
-            reusablePrefixCount: reusablePrefixCount
+            reusablePrefixCount: reusablePrefixCount,
+            styleRevision: styleRevision,
+            resourceIdentity: resourceIdentity,
+            resourceGeneration: resourceGeneration
         )
     }
 
@@ -114,7 +132,10 @@ final class AgentMarkdownRenderCommit {
         document: AgentMarkdownDocument,
         values: [NSAttributedString],
         previous: AgentMarkdownRenderCommit?,
-        reusablePrefixCount: Int
+        reusablePrefixCount: Int,
+        styleRevision: Int,
+        resourceIdentity: String?,
+        resourceGeneration: Int
     ) -> AgentMarkdownRenderCommit {
 
         let output = NSMutableAttributedString()
@@ -153,6 +174,9 @@ final class AgentMarkdownRenderCommit {
             snapshot: snapshot,
             typography: typography,
             tone: tone,
+            styleRevision: styleRevision,
+            resourceIdentity: resourceIdentity,
+            resourceGeneration: resourceGeneration,
             document: document,
             blocks: blocks,
             attributedValue: NSAttributedString(attributedString: output),
@@ -173,6 +197,9 @@ final class AgentMarkdownRenderCommit {
         snapshot: StreamingMarkdownSession.PreparedSnapshot,
         typography: WorkspaceTypography,
         tone: AgentMarkdownTone,
+        styleRevision: Int,
+        resourceIdentity: String?,
+        resourceGeneration: Int,
         document: AgentMarkdownDocument,
         blocks: [Block],
         attributedValue: NSAttributedString,
@@ -187,6 +214,9 @@ final class AgentMarkdownRenderCommit {
         self.snapshot = snapshot
         self.typography = typography
         self.tone = tone
+        self.styleRevision = styleRevision
+        self.resourceIdentity = resourceIdentity
+        self.resourceGeneration = resourceGeneration
         self.document = document
         self.blocks = blocks
         self.attributedValue = attributedValue
@@ -201,12 +231,18 @@ final class AgentMarkdownRenderCommit {
         document: AgentMarkdownDocument,
         previous: AgentMarkdownRenderCommit?,
         typography: WorkspaceTypography,
-        tone: AgentMarkdownTone
+        tone: AgentMarkdownTone,
+        styleRevision: Int,
+        resourceIdentity: String?,
+        resourceGeneration: Int
     ) -> Int {
         guard let previous,
               snapshot.contentVersion > previous.contentVersion,
               previous.typography == typography,
               previous.tone == tone,
+              previous.styleRevision == styleRevision,
+              previous.resourceIdentity == resourceIdentity,
+              previous.resourceGeneration == resourceGeneration,
               snapshot.document.stablePrefixCount > 0,
               snapshot.document.stablePrefixCount <= previous.blocks.count,
               snapshot.document.stablePrefixCount <= document.preparedBlocks.count
