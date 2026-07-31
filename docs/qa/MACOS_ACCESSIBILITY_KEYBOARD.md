@@ -99,6 +99,27 @@ reserved for selection rows whose full width is the intended hit target.
    user bubbles grow with their content, stop at the readable maximum, and wrap
    long lines without forcing the transcript wider.
 
+## Transcript interaction and Reduce Motion
+
+1. Enable Reduce Motion, then open and close the Explorer sections and each
+   Composer provider control. Confirm state, chevron rotation, focus order, and
+   layout match the normal-motion presentation with no transition animation.
+2. Stream a response while resizing the Navigator and repeatedly opening
+   Working, Thinking, and Tool details. Confirm the Composer does not oscillate,
+   Working remains capped at 320 points, Tool output remains capped at 220
+   points, and Tool text stays selectable and readable by VoiceOver.
+3. Select text in a completed prefix, then drag a selection across wrapped lines
+   while output continues. Confirm follow-tail pauses throughout the selection.
+   Clear the selection at the tail and confirm following resumes; repeat while
+   scrolled away and confirm the stable visible anchor remains fixed.
+4. Stream an unmatched fenced block, unsupported formula, and unavailable image.
+   Confirm the last valid prefix remains readable, the exact unsafe tail and
+   formula source are selectable, the image alt label is announced, and the next
+   valid update recovers without moving VoiceOver focus.
+5. Switch Projects and Sessions, then close and reopen the window. Confirm no
+   prior transcript selection, disclosure, pending resize, or resource state
+   appears in the new scope.
+
 ## Evidence
 
 Record one row per run. Do not mark the parity matrix Complete until the macOS
@@ -106,4 +127,4 @@ Record one row per run. Do not mark the parity matrix Complete until the macOS
 
 | macOS | Architecture | App build | Automated | VoiceOver | Full Keyboard Access | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
-| 26.6 | arm64 (Universal app) | ad-hoc `dist/apple/Kubecode.app`, 2026-07-25 09:56 +0800 | Pass, 2026-07-25 | Pending | Pending | Automated contract passed on the same OS release; assistive-technology traversal remains required. |
+| 26.6 | arm64 (Universal app) | ad-hoc `dist/apple/Kubecode.app`, 2026-07-25 09:56 +0800 | Pass, 2026-07-25 | Pending | Pending | Automated contract passed on the same OS release; VoiceOver, Full Keyboard Access, and Reduce Motion transcript traversal remain required. |

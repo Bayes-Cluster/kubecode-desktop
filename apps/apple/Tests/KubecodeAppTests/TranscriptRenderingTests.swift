@@ -22,6 +22,15 @@ private final class ApplicationConnectionOwnershipSpy: ApplicationConnectionOwne
     }
 }
 
+@MainActor
+private final class TranscriptInteractionRecorder {
+    private(set) var activity: [Bool] = []
+
+    func record(interactionID: UUID, isActive: Bool) {
+        activity.append(isActive)
+    }
+}
+
 @Suite(.serialized)
 @MainActor
 struct TranscriptRenderingTests {
@@ -1077,13 +1086,19 @@ struct TranscriptRenderingTests {
     }
 
     private func exerciseNativeMouseDragAcrossVisualLines() async throws {
+        let interactionRecorder = TranscriptInteractionRecorder()
+        let interactionContext = NativeTranscriptInteractionContext(
+            provenance: .init(sessionID: "drag-session", itemID: "drag-row"),
+            update: interactionRecorder.record
+        )
         let controller = NSHostingController(rootView: AgentMarkdownView(source: """
         Drag selection starts on the first visual line and continues through enough words to wrap.
 
         Drag selection ends on the final rendered paragraph.
         """)
         .frame(width: 320, height: 180, alignment: .topLeading)
-        .padding(20))
+        .padding(20)
+        .environment(\.nativeTranscriptInteractionContext, interactionContext))
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 360, height: 220),
             styleMask: [.borderless],
@@ -1162,6 +1177,9 @@ struct TranscriptRenderingTests {
         #expect(selected.contains("starts"))
         #expect(selected.contains("paragraph"))
         #expect(selected.contains("\n"))
+        #expect(interactionRecorder.activity == [true])
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        #expect(interactionRecorder.activity == [true, false])
         window.makeFirstResponder(nil)
         window.orderOut(nil)
         discardPendingPrimaryMouseEvents()
@@ -1208,6 +1226,8 @@ struct TranscriptRenderingTests {
         #expect(ComposerPresentationMetrics.leadingInset == 14)
         #expect(ComposerPresentationMetrics.controlSpacing == 12)
         #expect(ComposerPresentationMetrics.transitionDuration == 0.22)
+        #expect(WorkspaceMotionPolicy(reduceMotion: false).animation != nil)
+        #expect(WorkspaceMotionPolicy(reduceMotion: true).animation == nil)
         #expect(ComposerPresentationMetrics.agentDisclosureRotation(isPresented: false) == 0)
         #expect(ComposerPresentationMetrics.agentDisclosureRotation(isPresented: true) == 180)
         #expect(ComposerPresentationMetrics.shouldUseExpandedLayout(

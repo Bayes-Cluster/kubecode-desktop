@@ -1,4 +1,5 @@
 import AppKit
+import KubecodeMarkdown
 import SwiftUI
 import Testing
 @testable import KubecodeApp
@@ -270,6 +271,60 @@ struct StreamingTranscriptMarkdownTests {
         #expect(window.firstResponder === textView)
     }
 
+    @Test @MainActor func mounted_failed_build_keeps_native_prefix_selection_and_recovers_exact_tail() async throws {
+        let committed = "# Stable\n\nCommitted prefix.\n\n"
+        let failedSource = committed + "```swift\nlet value = 1"
+        let recoveredSource = failedSource + "\n```\n\n![Missing asset](missing.png)"
+        let builder = MountedFailureMarkdownBuilder(failedSource: failedSource)
+        let store = AgentMarkdownRenderStore(
+            documentBuilder: { await builder.build(source: $0, previous: $1) }
+        )
+        let controller = NSHostingController(rootView: MarkdownFailureHarness(
+            source: committed,
+            store: store
+        ))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 300),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        layout(window: window, controller: controller)
+        let textView = try #require(firstSubview(
+            of: NativeAgentMarkdownTextView.self,
+            in: controller.view
+        ))
+        try await waitForPreparedMarkdown(textView, containing: "Committed prefix")
+        let storage = try #require(textView.textStorage)
+        let stableSelection = try #require(textView.string.range(of: "Stable"))
+        let stableRange = NSRange(stableSelection, in: textView.string)
+        textView.setSelectedRange(stableRange)
+        #expect(window.makeFirstResponder(textView))
+
+        controller.rootView = MarkdownFailureHarness(source: failedSource, store: store)
+        layout(window: window, controller: controller)
+        try await waitForPreparedMarkdown(textView, containing: "```swift\nlet value = 1")
+        #expect(textView.textStorage === storage)
+        #expect(textView.selectedRange() == stableRange)
+        #expect(window.firstResponder === textView)
+        #expect(textView.accessibilityValue()?.contains("```swift\nlet value = 1") == true)
+        #expect(textView.copyResponseSource == failedSource)
+
+        controller.rootView = MarkdownFailureHarness(source: recoveredSource, store: store)
+        layout(window: window, controller: controller)
+        try await waitUntil {
+            textView.copyResponseSource == recoveredSource
+                && textView.accessibilityValue()?.contains("Missing asset") == true
+        }
+        #expect(textView.textStorage === storage)
+        #expect(textView.selectedRange() == stableRange)
+        #expect(window.firstResponder === textView)
+        #expect(await builder.invocationCount == 3)
+    }
+
     private func output(
         source: String,
         phase: TranscriptRunOutputPhase,
@@ -353,5 +408,45 @@ struct StreamingTranscriptMarkdownTests {
             }
             await Task.yield()
         }
+    }
+}
+
+private actor MountedFailureMarkdownBuilder {
+    let failedSource: String
+    private(set) var invocationCount = 0
+
+    init(failedSource: String) {
+        self.failedSource = failedSource
+    }
+
+    func build(
+        source: String,
+        previous: StreamingMarkdownDocument?
+    ) -> StreamingMarkdownDocument {
+        invocationCount += 1
+        if source == failedSource {
+            return StreamingMarkdownDocument(source: "failed build sentinel", previous: previous)
+        }
+        return StreamingMarkdownDocument(source: source, previous: previous)
+    }
+}
+
+@MainActor
+private struct MarkdownFailureHarness: View {
+    let source: String
+    let store: AgentMarkdownRenderStore
+
+    var body: some View {
+        AgentMarkdownView(
+            source: source,
+            copyResponseSource: source,
+            isStreaming: true,
+            renderItemID: "failure-output",
+            renderSegment: .runOutput
+        )
+        .environment(\.agentMarkdownRenderStore, store)
+        .workspaceTypography(WorkspaceTypography(fontName: "System", pointSize: 14))
+        .frame(width: 720, alignment: .topLeading)
+        .padding(20)
     }
 }

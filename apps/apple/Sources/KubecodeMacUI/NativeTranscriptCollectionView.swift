@@ -144,8 +144,40 @@ public struct NativeTranscriptDisclosureContext: Sendable {
     }
 }
 
+public struct NativeTranscriptInteractionContext: Sendable {
+    public struct Provenance: Hashable, Sendable {
+        public let sessionID: String?
+        public let itemID: String
+
+        public init(sessionID: String?, itemID: String) {
+            self.sessionID = sessionID
+            self.itemID = itemID
+        }
+    }
+
+    public let provenance: Provenance
+    private let updateAction: @MainActor @Sendable (UUID, Bool) -> Void
+
+    public init(
+        provenance: Provenance,
+        update: @escaping @MainActor @Sendable (UUID, Bool) -> Void
+    ) {
+        self.provenance = provenance
+        updateAction = update
+    }
+
+    @MainActor
+    public func selectionDidChange(interactionID: UUID, isActive: Bool) {
+        updateAction(interactionID, isActive)
+    }
+}
+
 private struct NativeTranscriptDisclosureContextKey: EnvironmentKey {
     static let defaultValue: NativeTranscriptDisclosureContext? = nil
+}
+
+private struct NativeTranscriptInteractionContextKey: EnvironmentKey {
+    static let defaultValue: NativeTranscriptInteractionContext? = nil
 }
 
 public extension EnvironmentValues {
@@ -157,6 +189,11 @@ public extension EnvironmentValues {
     var nativeTranscriptDisclosureContext: NativeTranscriptDisclosureContext? {
         get { self[NativeTranscriptDisclosureContextKey.self] }
         set { self[NativeTranscriptDisclosureContextKey.self] = newValue }
+    }
+
+    var nativeTranscriptInteractionContext: NativeTranscriptInteractionContext? {
+        get { self[NativeTranscriptInteractionContextKey.self] }
+        set { self[NativeTranscriptInteractionContextKey.self] = newValue }
     }
 }
 
@@ -493,6 +530,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         private var lastReportedNearBottom: Bool?
         private var lastViewportWidth: CGFloat?
         private var isLiveScrolling = false
+        private var activeSelectionInteractions: [UUID: (sessionID: String?, itemID: String)] = [:]
 
         public private(set) var geometryMutationCount = 0
         public private(set) var geometryCompletionCount = 0
@@ -510,6 +548,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             widthSettlementState.latest
         }
         public private(set) var lastReconfiguredItemIDs: Set<String> = []
+        public var activeSelectionInteractionCount: Int { activeSelectionInteractions.count }
 
         public func committedDisclosurePresentation(
             id: String
@@ -576,6 +615,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             preparationScheduled = false
             for host in renderMeasurementHosts.values { host.removeFromSuperview() }
             renderMeasurementHosts.removeAll(keepingCapacity: false)
+            activeSelectionInteractions.removeAll(keepingCapacity: false)
             NotificationCenter.default.removeObserver(self)
             collectionView = nil
             scrollView = nil
@@ -603,6 +643,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             if changedSession {
                 acceptedRenderHeights.removeAll(keepingCapacity: true)
                 removeRenderMeasurementHosts()
+                activeSelectionInteractions.removeAll(keepingCapacity: true)
                 scrollController.resumeFollowing()
                 userIntentRevision &+= 1
             }
@@ -937,6 +978,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             disclosures: TranscriptDisclosureGeometryState
         ) -> AnyView {
             let context: NativeTranscriptRowRenderContext?
+            let interactionContext: NativeTranscriptInteractionContext?
             if items.indices.contains(index) {
                 let item = items[index]
                 let provenance = NativeTranscriptRenderHeightProvenance(
@@ -955,19 +997,61 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                         )
                     }
                 )
+                interactionContext = NativeTranscriptInteractionContext(
+                    provenance: .init(sessionID: sessionID, itemID: item.id)
+                ) { [weak self] interactionID, isActive in
+                    self?.selectionInteractionDidChange(
+                        interactionID: interactionID,
+                        itemID: item.id,
+                        sessionID: sessionID,
+                        isActive: isActive
+                    )
+                }
             } else {
                 context = nil
+                interactionContext = nil
             }
             return AnyView(
                 rowBuilder(index)
                     .frame(width: width, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
                     .environment(\.nativeTranscriptRowRenderContext, context)
+                    .environment(\.nativeTranscriptInteractionContext, interactionContext)
                     .environment(
                         \.nativeTranscriptDisclosureContext,
                         NativeTranscriptDisclosureContext(state: disclosures)
                     )
             )
+        }
+
+        private func selectionInteractionDidChange(
+            interactionID: UUID,
+            itemID: String,
+            sessionID: String?,
+            isActive: Bool
+        ) {
+            if isActive {
+                guard sessionID == desiredSessionID,
+                      desiredItems.contains(where: { $0.id == itemID })
+                else { return }
+                guard activeSelectionInteractions[interactionID] == nil else { return }
+                let wasInactive = activeSelectionInteractions.isEmpty
+                activeSelectionInteractions[interactionID] = (sessionID, itemID)
+                guard wasInactive else { return }
+                userIntentRevision &+= 1
+                lastReportedNearBottom = false
+                scrollController.viewportDidChange(isNearBottom: false)
+                return
+            }
+
+            guard let active = activeSelectionInteractions[interactionID],
+                  active.sessionID == sessionID,
+                  active.itemID == itemID
+            else { return }
+            activeSelectionInteractions.removeValue(forKey: interactionID)
+            guard activeSelectionInteractions.isEmpty else { return }
+            userIntentRevision &+= 1
+            reportPosition(force: true)
         }
 
         @discardableResult

@@ -136,7 +136,10 @@ final class StreamingMarkdownSession {
         let builder = builder
         let previous = lastBuiltDocument ?? preparedSnapshot?.document
         activeTask = scheduler { [weak self] in
-            let document = await builder(request.source, previous)
+            let builtDocument = await builder(request.source, previous)
+            let document = builtDocument.source == request.source
+                ? builtDocument
+                : StreamingMarkdownDocument(source: request.source, previous: previous)
             await self?.complete(
                 jobID: request.jobID,
                 builtSource: request.source,

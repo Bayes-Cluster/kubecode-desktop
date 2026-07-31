@@ -547,6 +547,103 @@ struct TranscriptGeometryTransactionTests {
     }
 
 #if os(macOS)
+    @Test @MainActor func mounted_markdown_selection_suspends_follow_tail_until_existing_policy_resolves() throws {
+        let driver = ManualTranscriptGeometryDrivers()
+        let scrollController = TranscriptScrollController()
+        let source = String(repeating: "Selectable native Markdown line.\n", count: 40)
+        let snapshot = StreamingMarkdownSession.PreparedSnapshot(
+            source: source,
+            generation: 1,
+            contentVersion: 1,
+            document: StreamingMarkdownDocument(source: source)
+        )
+        let commit = AgentMarkdownRenderCommit.prepare(
+            snapshot: snapshot,
+            previous: nil,
+            typography: WorkspaceTypography(fontName: "System", pointSize: 14),
+            tone: .primary
+        )
+        let controller = NSHostingController(rootView: selectionTranscriptView(
+            source: source,
+            commit: commit,
+            scrollController: scrollController,
+            driver: driver
+        ))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 180),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        layout(window: window, controller: controller)
+        let collection = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        let scrollView = try #require(collection.enclosingScrollView)
+        let mountedFrame = NSRect(x: 0, y: 0, width: 640, height: 180)
+        controller.view.frame = mountedFrame
+        scrollView.frame = controller.view.bounds
+        scrollView.contentView.frame = scrollView.bounds
+        collection.frame = mountedFrame
+        NotificationCenter.default.post(
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        for _ in 0..<4 {
+            controller.view.frame = mountedFrame
+            scrollView.frame = controller.view.bounds
+            scrollView.contentView.frame = scrollView.bounds
+            collection.frame = mountedFrame
+            layout(window: window, controller: controller)
+            driver.drainAll()
+        }
+        layout(window: window, controller: controller)
+
+        let coordinator = try #require(
+            collection.delegate as? NativeTranscriptCollectionView.Coordinator
+        )
+        let mountedItem = coordinator.collectionView(
+            collection,
+            itemForRepresentedObjectAt: IndexPath(item: 1, section: 0)
+        )
+        mountedItem.view.frame = NSRect(x: 0, y: 0, width: 600, height: 600)
+        mountedItem.view.layoutSubtreeIfNeeded()
+        let textView = try #require(descendant(
+            of: NativeAgentMarkdownTextView.self,
+            in: mountedItem.view
+        ))
+        let selected = NSRange(location: 0, length: 10)
+
+        textView.setSelectedRange(selected)
+        #expect(coordinator.activeSelectionInteractionCount == 1)
+        #expect(!scrollController.followsOutput)
+        _ = scrollController.outputDidChange()
+        #expect(scrollController.hasUnseenOutput)
+
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: TranscriptScrollGeometry(
+            documentHeight: scrollView.documentView?.bounds.height ?? 0,
+            viewportHeight: scrollView.documentVisibleRect.height,
+            bottomObstructionHeight: scrollView.contentInsets.bottom
+        ).maximumOriginY))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        #expect(coordinator.activeSelectionInteractionCount == 0)
+        #expect(scrollController.followsOutput)
+
+        collection.setFrameSize(NSSize(width: collection.frame.width, height: 1_400))
+        scrollView.contentView.scroll(to: .zero)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        scrollController.viewportDidChange(isNearBottom: false)
+        textView.setSelectedRange(selected)
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        #expect(coordinator.activeSelectionInteractionCount == 0)
+        #expect(!scrollController.followsOutput)
+    }
+
     @Test @MainActor func mounted_disclosure_chrome_children_height_and_anchor_commit_together() throws {
         let driver = ManualTranscriptGeometryDrivers()
         let scrollController = TranscriptScrollController()
@@ -1930,6 +2027,43 @@ struct TranscriptGeometryTransactionTests {
             return AnyView(
                 Text("Stable away anchor")
                     .frame(maxWidth: .infinity, minHeight: 360, alignment: .topLeading)
+            )
+        }
+    }
+
+    @MainActor
+    private func selectionTranscriptView(
+        source: String,
+        commit: AgentMarkdownRenderCommit,
+        scrollController: TranscriptScrollController,
+        driver: ManualTranscriptGeometryDrivers
+    ) -> NativeTranscriptCollectionView {
+        NativeTranscriptCollectionView(
+            items: [
+                NativeTranscriptItem(id: "selection-anchor", contentRevision: 1),
+                NativeTranscriptItem(id: "selection", contentRevision: 1),
+            ],
+            sessionID: "selection-session",
+            outputRevision: "selection-output",
+            bottomInset: 0,
+            scrollController: scrollController,
+            geometryDrivers: driver.value
+        ) { index in
+            if index == 0 {
+                return AnyView(
+                    Text("Stable away-from-tail anchor")
+                        .frame(maxWidth: .infinity, minHeight: 600, alignment: .topLeading)
+                )
+            }
+            return AnyView(
+                NativeSelectableAgentMarkdownView(
+                    source: source,
+                    typography: WorkspaceTypography(fontName: "System", pointSize: 14),
+                    tone: .primary,
+                    copyResponseSource: source,
+                    preparedCommit: commit
+                )
+                .frame(maxWidth: .infinity, minHeight: 600, alignment: .topLeading)
             )
         }
     }

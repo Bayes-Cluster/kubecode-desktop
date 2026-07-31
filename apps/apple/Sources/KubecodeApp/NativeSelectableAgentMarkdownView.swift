@@ -1,5 +1,6 @@
 import AppKit
 import KubecodeMarkdown
+import KubecodeMacUI
 import SwiftUI
 
 enum AgentMarkdownTone: Equatable, Hashable {
@@ -21,6 +22,8 @@ final class NativeAgentMarkdownTextView: NSTextView {
         didSet { updateAccessibilityCustomActions() }
     }
     var linkOpener: ((URL) -> Void)?
+    fileprivate var mouseSelectionDidChange: ((Bool) -> Void)?
+    fileprivate private(set) var isSelectingWithMouse = false
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
@@ -99,6 +102,14 @@ final class NativeAgentMarkdownTextView: NSTextView {
         }
     }
 
+    override func mouseDown(with event: NSEvent) {
+        isSelectingWithMouse = true
+        mouseSelectionDidChange?(true)
+        super.mouseDown(with: event)
+        isSelectingWithMouse = false
+        mouseSelectionDidChange?(false)
+    }
+
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = super.menu(for: event) ?? NSMenu()
         let identifier = NSUserInterfaceItemIdentifier(
@@ -169,6 +180,7 @@ final class NativeAgentMarkdownTextView: NSTextView {
 }
 
 struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
+    @Environment(\.nativeTranscriptInteractionContext) private var interactionContext
     let source: String
     let typography: WorkspaceTypography
     let tone: AgentMarkdownTone
@@ -205,7 +217,10 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator {
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        private let interactionID = UUID()
+        private var interactionContext: NativeTranscriptInteractionContext?
+        private var publishedSelectionActivity = false
         private var renderedKey: RenderedKey?
         private var renderedValue: NSAttributedString?
         private var legacyAppliedKey: RenderedKey?
@@ -221,6 +236,65 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         private(set) var preparedRenderCount = 0
         private(set) var preparedApplyCount = 0
         private(set) var latestPreparedCommit: AgentMarkdownRenderCommit?
+
+        func attach(to textView: NativeAgentMarkdownTextView) {
+            textView.delegate = self
+            textView.mouseSelectionDidChange = { [weak self, weak textView] _ in
+                guard let self, let textView else { return }
+                self.publishSelectionActivity(from: textView)
+            }
+        }
+
+        func updateInteractionContext(
+            _ interactionContext: NativeTranscriptInteractionContext?,
+            textView: NativeAgentMarkdownTextView
+        ) {
+            if self.interactionContext?.provenance == interactionContext?.provenance {
+                self.interactionContext = interactionContext
+                publishSelectionActivity(from: textView)
+                return
+            }
+            if self.interactionContext == nil, interactionContext == nil { return }
+            if publishedSelectionActivity {
+                self.interactionContext?.selectionDidChange(
+                    interactionID: interactionID,
+                    isActive: false
+                )
+                publishedSelectionActivity = false
+            }
+            self.interactionContext = interactionContext
+            publishSelectionActivity(from: textView)
+        }
+
+        func detach(from textView: NativeAgentMarkdownTextView) {
+            if publishedSelectionActivity {
+                interactionContext?.selectionDidChange(
+                    interactionID: interactionID,
+                    isActive: false
+                )
+            }
+            publishedSelectionActivity = false
+            interactionContext = nil
+            textView.mouseSelectionDidChange = nil
+            if textView.delegate === self { textView.delegate = nil }
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? NativeAgentMarkdownTextView else { return }
+            publishSelectionActivity(from: textView)
+        }
+
+        private func publishSelectionActivity(from textView: NativeAgentMarkdownTextView) {
+            let selection = textView.selectedRange()
+            let isActive = textView.isSelectingWithMouse
+                || (selection.location != NSNotFound && selection.length > 0)
+            guard isActive != publishedSelectionActivity else { return }
+            publishedSelectionActivity = isActive
+            interactionContext?.selectionDidChange(
+                interactionID: interactionID,
+                isActive: isActive
+            )
+        }
 
         func rendered(
             source: String,
@@ -381,12 +455,20 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         textView.autoresizingMask = [.width]
         textView.setContentHuggingPriority(.defaultLow, for: .horizontal)
         textView.setContentHuggingPriority(.defaultLow, for: .vertical)
+        context.coordinator.attach(to: textView)
         update(textView, coordinator: context.coordinator)
         return textView
     }
 
     func updateNSView(_ textView: NativeAgentMarkdownTextView, context: Context) {
         update(textView, coordinator: context.coordinator)
+    }
+
+    static func dismantleNSView(
+        _ textView: NativeAgentMarkdownTextView,
+        coordinator: Coordinator
+    ) {
+        coordinator.detach(from: textView)
     }
 
     func sizeThatFits(
@@ -420,6 +502,7 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         _ textView: NativeAgentMarkdownTextView,
         coordinator: Coordinator
     ) {
+        coordinator.updateInteractionContext(interactionContext, textView: textView)
         textView.copyResponseSource = copyResponseSource
         guard let preparedCommit else { return }
         coordinator.receivePreparedCommit(

@@ -2,6 +2,16 @@
 import AppKit
 import SwiftUI
 
+struct WorkspaceMotionPolicy {
+    let reduceMotion: Bool
+
+    var animation: Animation? {
+        reduceMotion
+            ? nil
+            : .easeInOut(duration: ComposerPresentationMetrics.transitionDuration)
+    }
+}
+
 enum ComposerHeightCalculator {
     static let minimumHeight: CGFloat = 36
     static let maximumHeight: CGFloat = 72
