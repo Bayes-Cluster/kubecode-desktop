@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import KubecodeMarkdown
 import KubecodeMacUI
 #if os(macOS)
 import AppKit
@@ -10,6 +11,73 @@ import KubecodeUI
 
 @Suite
 struct TranscriptGeometryTransactionTests {
+    @Test func bursty_width_observations_begin_only_the_latest_generation() throws {
+        var state = TranscriptWidthSettlementState(initialEffectiveWidth: 600)
+
+        let firstAValue = state.observe(effectiveWidth: 800)
+        let firstA = try #require(firstAValue)
+        let bValue = state.observe(effectiveWidth: 720)
+        let b = try #require(bValue)
+        let latestAValue = state.observe(effectiveWidth: 800)
+        let latestA = try #require(latestAValue)
+
+        #expect(firstA.generation < b.generation)
+        #expect(b.generation < latestA.generation)
+        #expect(firstA.effectiveWidth == latestA.effectiveWidth)
+        #expect(state.active == nil)
+        #expect(state.pending == latestA)
+        #expect(state.retainedTargetCount == 1)
+        let duplicate = state.observe(effectiveWidth: 800)
+        #expect(duplicate == nil)
+
+        let staleFirst = state.beginPending(expectedGeneration: firstA.generation)
+        let staleSecond = state.beginPending(expectedGeneration: b.generation)
+        let beganLatest = state.beginPending(expectedGeneration: latestA.generation)
+        #expect(staleFirst == nil)
+        #expect(staleSecond == nil)
+        #expect(beganLatest == latestA)
+        #expect(state.active == latestA)
+        #expect(state.pending == nil)
+        #expect(state.retainedTargetCount == 1)
+    }
+
+    @Test func active_width_keeps_only_one_replaceable_latest_and_rejects_stale_completion() throws {
+        var state = TranscriptWidthSettlementState(initialEffectiveWidth: 600)
+        let activeValue = state.observe(effectiveWidth: 760)
+        let active = try #require(activeValue)
+        let beganActive = state.beginPending(expectedGeneration: active.generation)
+        #expect(beganActive == active)
+
+        let obsoleteValue = state.observe(effectiveWidth: 680)
+        let obsolete = try #require(obsoleteValue)
+        let latestValue = state.observe(effectiveWidth: 540)
+        let latest = try #require(latestValue)
+        #expect(state.active == active)
+        #expect(state.pending == latest)
+        #expect(state.pending != obsolete)
+        #expect(state.retainedTargetCount == 2)
+
+        let beforeStale = state
+        let acceptedStale = state.complete(generation: obsolete.generation)
+        #expect(!acceptedStale)
+        #expect(state == beforeStale)
+        let acceptedActive = state.complete(generation: active.generation)
+        #expect(acceptedActive)
+        #expect(state.committed.effectiveWidth == active.effectiveWidth)
+        #expect(state.active == nil)
+        #expect(state.pending == latest)
+
+        let beganLatest = state.beginPending(expectedGeneration: latest.generation)
+        #expect(beganLatest == latest)
+        let rejectedOld = state.reject(generation: active.generation)
+        #expect(!rejectedOld)
+        #expect(state.active == latest)
+        let rejectedLatest = state.reject(generation: latest.generation)
+        #expect(rejectedLatest)
+        #expect(state.committed.effectiveWidth == active.effectiveWidth)
+        #expect(state.active == nil)
+    }
+
     @Test func disclosure_geometry_is_latest_only_behind_an_active_streaming_transaction() throws {
         var state = TranscriptGeometryTransactionState(committed: disclosureTarget(
             sourceRevision: 1,
@@ -654,6 +722,294 @@ struct TranscriptGeometryTransactionTests {
         #expect(shrink.settledFrameWidth == 474)
     }
 
+    @Test @MainActor func mounted_width_burst_commits_only_latest_and_preserves_away_anchor() throws {
+        let driver = ManualTranscriptGeometryDrivers()
+        let scrollController = TranscriptScrollController()
+        let controller = NSHostingController(rootView: widthTranscriptView(
+            scrollController: scrollController,
+            driver: driver
+        ))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 240),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        layout(window: window, controller: controller)
+        let collection = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        let scrollView = try #require(collection.enclosingScrollView)
+        scrollView.scrollerStyle = .overlay
+        controller.view.frame = window.contentView?.bounds
+            ?? NSRect(x: 0, y: 0, width: 720, height: 240)
+        scrollView.frame = controller.view.bounds
+        scrollView.layoutSubtreeIfNeeded()
+        scrollView.contentView.frame = scrollView.bounds
+        collection.frame = NSRect(x: 0, y: 0, width: 720, height: 240)
+        NotificationCenter.default.post(
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        for _ in 0..<4 {
+            controller.view.frame = window.contentView?.bounds
+                ?? NSRect(x: 0, y: 0, width: 720, height: 240)
+            scrollView.frame = controller.view.bounds
+            scrollView.contentView.frame = scrollView.bounds
+            collection.frame = NSRect(x: 0, y: 0, width: 720, height: 240)
+            layout(window: window, controller: controller)
+            driver.drainAll()
+        }
+        layout(window: window, controller: controller)
+        collection.collectionViewLayout?.invalidateLayout()
+        collection.layoutSubtreeIfNeeded()
+
+        let coordinator = try #require(
+            collection.delegate as? NativeTranscriptCollectionView.Coordinator
+        )
+        try #require(collection.numberOfItems(inSection: 0) == 3)
+        let anchorAttributes = try #require(collection.layoutAttributesForItem(
+            at: IndexPath(item: 0, section: 0)
+        ))
+        let initialScrollGeometry = TranscriptScrollGeometry(
+            documentHeight: scrollView.documentView?.bounds.height ?? 0,
+            viewportHeight: scrollView.documentVisibleRect.height,
+            bottomObstructionHeight: scrollView.contentInsets.bottom
+        )
+        #expect(initialScrollGeometry.maximumOriginY > 0)
+        let initialAnchorMinY = anchorAttributes.frame.minY
+        let origin = initialScrollGeometry.clampedOriginY(100)
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: origin))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        scrollController.viewportDidChange(isNearBottom: false)
+        let anchor = TranscriptGeometryAnchor(
+            itemID: "width-row-0",
+            offset: initialAnchorMinY - scrollView.documentVisibleRect.minY
+        )
+        driver.viewportAnchor = anchor
+        let initialSize = coordinator.collectionView(
+            collection,
+            layout: collection.collectionViewLayout!,
+            sizeForItemAt: IndexPath(item: 0, section: 0)
+        )
+        let initialMutationCount = coordinator.geometryMutationCount
+        let initialCompletionCount = coordinator.geometryCompletionCount
+
+        for width in [900.0, 640.0, 840.0] {
+            controller.view.frame.size.width = width
+            scrollView.frame = controller.view.bounds
+            scrollView.contentView.frame = scrollView.bounds
+            NotificationCenter.default.post(
+                name: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView
+            )
+        }
+
+        let latestWidth = try #require(driver.pendingWidthSettlementTarget)
+        #expect(driver.canceledWidthSettlementCount >= 2)
+        #expect(driver.preparations.isEmpty)
+        #expect(driver.mutations.isEmpty)
+        #expect(coordinator.pendingWidthSettlement == latestWidth)
+        #expect(coordinator.pendingGeometryEffectiveWidth == latestWidth.effectiveWidth)
+
+        driver.releaseCanceledWidthSettlement()
+        #expect(driver.preparations.isEmpty)
+        #expect(driver.mutations.isEmpty)
+        #expect(coordinator.geometryMutationCount == initialMutationCount)
+        #expect(coordinator.geometryCompletionCount == initialCompletionCount)
+        #expect(coordinator.collectionView(
+            collection,
+            layout: collection.collectionViewLayout!,
+            sizeForItemAt: IndexPath(item: 0, section: 0)
+        ) == initialSize)
+
+        driver.releaseWidthSettlement()
+        #expect(driver.preparations.count == 1)
+        driver.releasePreparation()
+        #expect(driver.mutations.count == 1)
+        #expect(coordinator.inFlightGeometryGeneration != nil)
+        #expect(coordinator.activeWidthSettlement == latestWidth)
+        #expect(coordinator.geometryMutationCount == initialMutationCount)
+
+        driver.releaseMutation()
+        layout(window: window, controller: controller)
+        #expect(driver.completions.count == 1)
+        #expect(coordinator.geometryMutationCount == initialMutationCount + 1)
+        let settledSize = coordinator.collectionView(
+            collection,
+            layout: collection.collectionViewLayout!,
+            sizeForItemAt: IndexPath(item: 0, section: 0)
+        )
+        #expect(settledSize.width == latestWidth.effectiveWidth)
+        let sectionInset = try #require(
+            collection.collectionViewLayout as? NSCollectionViewFlowLayout
+        ).sectionInset
+        #expect(settledSize.width < collection.frame.width - sectionInset.left - sectionInset.right)
+
+        driver.releaseCompletion()
+        #expect(coordinator.inFlightGeometryGeneration == nil)
+        #expect(coordinator.pendingWidthSettlement == nil)
+        #expect(coordinator.activeWidthSettlement == nil)
+        #expect(coordinator.geometryCompletionCount == initialCompletionCount + 1)
+        let settledAnchor = try #require(collection.layoutAttributesForItem(
+            at: IndexPath(item: 0, section: 0)
+        ))
+        let anchorDelta = settledAnchor.frame.minY
+            - scrollView.documentVisibleRect.minY
+            - anchor.offset
+        #expect(abs(anchorDelta) <= 1)
+        #expect(!scrollController.followsOutput)
+
+        let frameAfterCommit = collection.frame
+        let originAfterCommit = scrollView.documentVisibleRect.origin
+        driver.releaseCanceledWidthSettlement()
+        #expect(collection.frame == frameAfterCommit)
+        #expect(scrollView.documentVisibleRect.origin == originAfterCommit)
+        #expect(coordinator.geometryMutationCount == initialMutationCount + 1)
+        #expect(coordinator.geometryCompletionCount == initialCompletionCount + 1)
+        #expect(driver.preparations.isEmpty)
+        #expect(driver.mutations.isEmpty)
+        #expect(driver.completions.isEmpty)
+    }
+
+    @Test @MainActor func mounted_width_only_commit_reuses_markdown_session_commit_and_text_storage() async throws {
+        let driver = ManualTranscriptGeometryDrivers()
+        let scrollController = TranscriptScrollController()
+        let counter = GeometryMarkdownDocumentBuildCounter()
+        let store = AgentMarkdownRenderStore(documentBuilder: counter.build)
+        let source = String(repeating: "A wrapping **Markdown** response. ", count: 20)
+        let identity = AgentMarkdownRenderIdentity(
+            scope: .init(projectIdentity: nil, sessionID: "mounted-attachment"),
+            rowID: "markdown",
+            segment: .standalone
+        )
+        let controller = NSHostingController(rootView: markdownTranscriptView(
+            source: source,
+            revision: 1,
+            store: store,
+            scrollController: scrollController,
+            driver: driver
+        ))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 240),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        layout(window: window, controller: controller)
+        let collection = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        let scrollView = try #require(collection.enclosingScrollView)
+        scrollView.scrollerStyle = .overlay
+        controller.view.frame = window.contentView?.bounds
+            ?? NSRect(x: 0, y: 0, width: 640, height: 240)
+        scrollView.frame = controller.view.bounds
+        scrollView.contentView.frame = scrollView.bounds
+        collection.frame = NSRect(x: 0, y: 0, width: 640, height: 240)
+        layout(window: window, controller: controller)
+
+        try await waitForGeometry("initial Markdown preparation") {
+            !driver.preparations.isEmpty
+        }
+        driver.releasePreparation()
+        try await drivePreparationsUntilMutation(
+            driver: driver,
+            window: window,
+            controller: controller
+        )
+        driver.releaseMutation()
+        layout(window: window, controller: controller)
+        driver.releaseCompletion()
+        layout(window: window, controller: controller)
+        let coordinator = try #require(
+            collection.delegate as? NativeTranscriptCollectionView.Coordinator
+        )
+        let mountedItem = coordinator.collectionView(
+            collection,
+            itemForRepresentedObjectAt: IndexPath(item: 0, section: 0)
+        )
+        let mountedSize = coordinator.collectionView(
+            collection,
+            layout: collection.collectionViewLayout!,
+            sizeForItemAt: IndexPath(item: 0, section: 0)
+        )
+        mountedItem.view.frame = NSRect(origin: .zero, size: mountedSize)
+        controller.view.addSubview(mountedItem.view)
+        mountedItem.view.layoutSubtreeIfNeeded()
+        try await waitForGeometry("visible Markdown host") {
+            mountedItem.view.layoutSubtreeIfNeeded()
+            return descendant(
+                of: NativeAgentMarkdownTextView.self,
+                in: mountedItem.view
+            ) != nil
+        }
+
+        let textView = try #require(descendant(
+            of: NativeAgentMarkdownTextView.self,
+            in: mountedItem.view
+        ))
+        let textStorage = try #require(textView.textStorage)
+        let session = try #require(store.testingSession(identity: identity))
+        let commit = try #require(store.latestRenderCommit(identity: identity))
+        let parseCount = counter.count
+        let preparationCount = session.preparationCount
+        let measurementCount = store.testingMeasurementCount
+        let initialMutationCount = coordinator.geometryMutationCount
+        let initialCompletionCount = coordinator.geometryCompletionCount
+
+        controller.view.frame.size.width = 800
+        scrollView.frame = controller.view.bounds
+        scrollView.contentView.frame = scrollView.bounds
+        NotificationCenter.default.post(
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        let widthTarget = try #require(driver.pendingWidthSettlementTarget)
+        #expect(driver.preparations.isEmpty)
+        driver.releaseWidthSettlement()
+        try await drivePreparationsUntilMutation(
+            driver: driver,
+            window: window,
+            controller: controller
+        )
+        driver.releaseMutation()
+        layout(window: window, controller: controller)
+        driver.releaseCompletion()
+        let settledMountedSize = coordinator.collectionView(
+            collection,
+            layout: collection.collectionViewLayout!,
+            sizeForItemAt: IndexPath(item: 0, section: 0)
+        )
+        mountedItem.view.frame.size = settledMountedSize
+        mountedItem.view.layoutSubtreeIfNeeded()
+
+        let settledTextView = try #require(descendant(
+            of: NativeAgentMarkdownTextView.self,
+            in: mountedItem.view
+        ))
+        #expect(coordinator.activeWidthSettlement == nil)
+        #expect(coordinator.pendingWidthSettlement == nil)
+        #expect(coordinator.desiredWidthSettlement == widthTarget)
+        #expect(coordinator.geometryMutationCount == initialMutationCount + 1)
+        #expect(coordinator.geometryCompletionCount == initialCompletionCount + 1)
+        #expect(store.testingSession(identity: identity) === session)
+        #expect(store.latestRenderCommit(identity: identity) === commit)
+        #expect(counter.count == parseCount)
+        #expect(session.preparationCount == preparationCount)
+        #expect(store.testingMeasurementCount > measurementCount)
+        #expect(settledTextView === textView)
+        #expect(settledTextView.textStorage === textStorage)
+    }
+
     @Test func mounted_markdown_height_authority_tracks_actual_disclosure_content() {
         let user = TranscriptSurfaceHeightAuthority.resolve(
             role: .user,
@@ -983,6 +1339,7 @@ struct TranscriptGeometryTransactionTests {
         scrollView.frame = controller.view.bounds
         scrollView.contentView.frame = scrollView.bounds
         collection.frame = initialFrame
+        driver.releaseWidthSettlement()
         driver.releasePreparation()
         driver.releasePreparation()
 
@@ -1031,8 +1388,10 @@ struct TranscriptGeometryTransactionTests {
             object: scrollView.contentView
         )
         layout(window: window, controller: controller)
+        driver.releaseWidthSettlement()
         driver.releasePreparation()
         let resizedOuterWidth = try #require(coordinator.pendingGeometryEffectiveWidth)
+        let resizedWidthGeneration = coordinator.desiredWidthSettlement.generation
         #expect(resizedOuterWidth != oldOuterWidth)
         let lower = NativeTranscriptRenderHeightValue(
             key: .init(
@@ -1048,6 +1407,7 @@ struct TranscriptGeometryTransactionTests {
                 itemID: "row",
                 contentRevision: 1,
                 outerEffectiveWidth: resizedOuterWidth,
+                widthGeneration: resizedWidthGeneration,
                 sessionID: "session-one"
             )
         ))
@@ -1057,6 +1417,7 @@ struct TranscriptGeometryTransactionTests {
                 itemID: "row",
                 contentRevision: 1,
                 outerEffectiveWidth: resizedOuterWidth,
+                widthGeneration: resizedWidthGeneration,
                 sessionID: "session-one"
             )
         ))
@@ -1066,6 +1427,7 @@ struct TranscriptGeometryTransactionTests {
                 itemID: "row",
                 contentRevision: 1,
                 outerEffectiveWidth: resizedOuterWidth,
+                widthGeneration: resizedWidthGeneration,
                 sessionID: "session-one"
             )
         ))
@@ -1102,6 +1464,7 @@ struct TranscriptGeometryTransactionTests {
                 itemID: "row",
                 contentRevision: 1,
                 outerEffectiveWidth: resizedOuterWidth,
+                widthGeneration: resizedWidthGeneration,
                 sessionID: "session-one"
             )
         ))
@@ -1111,6 +1474,7 @@ struct TranscriptGeometryTransactionTests {
                 itemID: "row",
                 contentRevision: 1,
                 outerEffectiveWidth: resizedOuterWidth,
+                widthGeneration: resizedWidthGeneration,
                 sessionID: "session-two"
             )
         ))
@@ -1507,6 +1871,28 @@ struct TranscriptGeometryTransactionTests {
     }
 
     @MainActor
+    private func widthTranscriptView(
+        scrollController: TranscriptScrollController,
+        driver: ManualTranscriptGeometryDrivers
+    ) -> NativeTranscriptCollectionView {
+        NativeTranscriptCollectionView(
+            items: (0..<3).map { index in
+                NativeTranscriptItem(id: "width-row-\(index)", contentRevision: 1)
+            },
+            sessionID: "width-session",
+            outputRevision: "stable-width-output",
+            bottomInset: 0,
+            scrollController: scrollController,
+            geometryDrivers: driver.value
+        ) { index in
+            AnyView(
+                Text("Width row \(index)")
+                    .frame(maxWidth: .infinity, minHeight: 220, alignment: .topLeading)
+            )
+        }
+    }
+
+    @MainActor
     private func markdownTranscriptView(
         source: String,
         revision: Int,
@@ -1623,6 +2009,9 @@ struct TranscriptGeometryTransactionTests {
     ) async throws {
         try await waitForGeometry("ready mutation") {
             layout(window: window, controller: controller)
+            if driver.pendingWidthSettlementTarget != nil {
+                driver.releaseWidthSettlement()
+            }
             if !driver.preparations.isEmpty { driver.releasePreparation() }
             return !driver.mutations.isEmpty
         }
@@ -1637,6 +2026,9 @@ struct TranscriptGeometryTransactionTests {
     ) async throws {
         try await waitForGeometry("queued attachment target") {
             layout(window: window, controller: controller)
+            if driver.pendingWidthSettlementTarget != nil {
+                driver.releaseWidthSettlement()
+            }
             if !driver.preparations.isEmpty {
                 driver.releasePreparation()
                 return false
@@ -1717,16 +2109,40 @@ private struct GeometryDisclosureProbe: View {
 
 @MainActor
 private final class ManualTranscriptGeometryDrivers {
+    private struct WidthSettlement {
+        let target: TranscriptWidthSettlementTarget
+        let action: @MainActor () -> Void
+    }
+
     private(set) var preparations: [@MainActor () -> Void] = []
     private(set) var mutations: [@MainActor () -> Void] = []
     private(set) var completions: [@MainActor () -> Void] = []
+    private var widthSettlement: WidthSettlement?
+    private var canceledWidthSettlements: [WidthSettlement] = []
     var viewportAnchor: TranscriptGeometryAnchor?
+
+    var pendingWidthSettlementTarget: TranscriptWidthSettlementTarget? {
+        widthSettlement?.target
+    }
+
+    var canceledWidthSettlementCount: Int { canceledWidthSettlements.count }
 
     var value: NativeTranscriptGeometryDrivers {
         NativeTranscriptGeometryDrivers(
             preparation: { [weak self] action in self?.preparations.append(action) },
             mutation: { [weak self] action in self?.mutations.append(action) },
             completion: { [weak self] action in self?.completions.append(action) },
+            widthSettlement: { [weak self] target, action in
+                self?.widthSettlement = WidthSettlement(target: target, action: action)
+                return { [weak self] in
+                    guard let self,
+                          let settlement = self.widthSettlement,
+                          settlement.target == target
+                    else { return }
+                    self.canceledWidthSettlements.append(settlement)
+                    self.widthSettlement = nil
+                }
+            },
             viewportAnchor: { [weak self] in self?.viewportAnchor }
         )
     }
@@ -1746,13 +2162,38 @@ private final class ManualTranscriptGeometryDrivers {
         completions.removeFirst()()
     }
 
+    func releaseWidthSettlement() {
+        guard let settlement = widthSettlement else { return }
+        widthSettlement = nil
+        settlement.action()
+    }
+
+    func releaseCanceledWidthSettlement() {
+        guard !canceledWidthSettlements.isEmpty else { return }
+        canceledWidthSettlements.removeFirst().action()
+    }
+
     func drainAll() {
         for _ in 0..<20 {
+            if pendingWidthSettlementTarget != nil { releaseWidthSettlement(); continue }
             if !preparations.isEmpty { releasePreparation(); continue }
             if !mutations.isEmpty { releaseMutation(); continue }
             if !completions.isEmpty { releaseCompletion(); continue }
             return
         }
+    }
+}
+
+@MainActor
+private final class GeometryMarkdownDocumentBuildCounter {
+    private(set) var count = 0
+
+    func build(
+        source: String,
+        previous: StreamingMarkdownDocument?
+    ) -> StreamingMarkdownDocument {
+        count += 1
+        return StreamingMarkdownDocument(source: source, previous: previous)
     }
 }
 
