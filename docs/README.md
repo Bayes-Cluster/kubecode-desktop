@@ -37,6 +37,7 @@
 | [0022](adr/0022-composer-aware-transcript-layout.md) | Accepted | Measured composer obstruction and deterministic transcript row settlement |
 | [0032](adr/0032-stable-markdown-row-session-ownership.md) | Accepted | Stable scoped Markdown row sessions, bounded recovery, and deterministic teardown |
 | [0033](adr/0033-stable-bounded-transcript-disclosures.md) | Accepted | Stable semantic identity and bounded native Working/Tool disclosure content |
+| [0034](adr/0034-atomic-disclosure-geometry-transactions.md) | Accepted | Atomic disclosure presentation and transcript geometry transactions |
 
 Proposed ADRs are implementation-ready recommendations. Move one to Accepted
 before starting work that depends on its long-term boundary.

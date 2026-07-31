@@ -10,6 +10,235 @@ import KubecodeUI
 
 @Suite
 struct TranscriptGeometryTransactionTests {
+    @Test func disclosure_geometry_is_latest_only_behind_an_active_streaming_transaction() throws {
+        var state = TranscriptGeometryTransactionState(committed: disclosureTarget(
+            sourceRevision: 1,
+            disclosureRevision: 1,
+            expanded: false
+        ))
+
+        _ = state.submit(disclosureTarget(
+            sourceRevision: 2,
+            disclosureRevision: 1,
+            expanded: false
+        ))
+        let streamingValue = state.beginIfReady()
+        let streaming = try #require(streamingValue)
+        #expect(streaming.target.disclosures.presentation(for: "working")?.isExpanded == false)
+
+        #expect(state.submit(disclosureTarget(
+            sourceRevision: 2,
+            disclosureRevision: 2,
+            expanded: true
+        )) == 2)
+        #expect(state.submit(disclosureTarget(
+            sourceRevision: 3,
+            disclosureRevision: 2,
+            expanded: true
+        )) == 3)
+        #expect(state.pending?.disclosures.presentation(for: "working")?.isExpanded == true)
+        #expect(state.beginIfReady() == nil)
+
+        let streamingCompletion = state.complete(
+            transactionGeneration: streaming.generation,
+            completionProvenance: streaming.completionProvenance,
+            currentUserIntentRevision: 1
+        )
+        #expect(streamingCompletion.viewportEffect == nil)
+        let disclosureValue = state.beginIfReady()
+        let disclosure = try #require(disclosureValue)
+        #expect(disclosure.intentGeneration == 3)
+        #expect(disclosure.target.items.map(\.id) == ["working", "working-details"])
+        #expect(disclosure.target.disclosures.presentation(for: "working")?.isExpanded == true)
+        #expect(disclosure.target.items.first?.contentRevision == 3)
+    }
+
+    @Test func disclosure_completion_requires_exact_session_content_width_and_generation() throws {
+        let collapsed = disclosureTarget(
+            sourceRevision: 1,
+            disclosureRevision: 1,
+            expanded: false
+        )
+        let expanded = disclosureTarget(
+            sourceRevision: 1,
+            disclosureRevision: 2,
+            expanded: true
+        )
+        var state = TranscriptGeometryTransactionState(committed: collapsed)
+        _ = state.submit(expanded)
+        let transactionValue = state.beginIfReady()
+        let transaction = try #require(transactionValue)
+
+        let wrongSession = TranscriptGeometryCompletionProvenance(
+            sessionID: "old-session",
+            items: transaction.target.items,
+            sizes: transaction.target.sizes,
+            effectiveWidth: transaction.target.effectiveWidth,
+            disclosures: transaction.target.disclosures
+        )
+        let wrongWidth = TranscriptGeometryCompletionProvenance(
+            sessionID: "session",
+            items: transaction.target.items,
+            sizes: transaction.target.sizes,
+            effectiveWidth: 600,
+            disclosures: transaction.target.disclosures
+        )
+        var wrongContentItems = transaction.target.items
+        wrongContentItems[0] = TranscriptGeometryItem(
+            id: wrongContentItems[0].id,
+            contentRevision: wrongContentItems[0].contentRevision + 1,
+            layoutRevision: wrongContentItems[0].layoutRevision,
+            heightAuthority: wrongContentItems[0].heightAuthority
+        )
+        let wrongContent = TranscriptGeometryCompletionProvenance(
+            sessionID: "session",
+            items: wrongContentItems,
+            sizes: transaction.target.sizes,
+            effectiveWidth: transaction.target.effectiveWidth,
+            disclosures: transaction.target.disclosures
+        )
+        var oldDisclosures = transaction.target.disclosures
+        let replaced = oldDisclosures.replace(.init(
+            id: "working",
+            ownerItemID: "working",
+            revision: 1,
+            isExpanded: false
+        ))
+        #expect(replaced)
+        let oldDisclosure = TranscriptGeometryCompletionProvenance(
+            sessionID: "session",
+            items: transaction.target.items,
+            sizes: transaction.target.sizes,
+            effectiveWidth: transaction.target.effectiveWidth,
+            disclosures: oldDisclosures
+        )
+
+        for incompatible in [wrongSession, wrongContent, wrongWidth, oldDisclosure] {
+            #expect(state.complete(
+                transactionGeneration: transaction.generation,
+                completionProvenance: incompatible,
+                currentUserIntentRevision: 1
+            ) == .stale)
+            #expect(state.inFlight?.generation == transaction.generation)
+        }
+        #expect(state.complete(
+            transactionGeneration: transaction.generation,
+            completionProvenance: transaction.completionProvenance,
+            currentUserIntentRevision: 1
+        ).accepted)
+        #expect(state.submit(expanded) == nil)
+    }
+
+    @Test func disclosure_targets_require_unique_ids_and_existing_owner_rows() {
+        let valid = disclosureTarget(
+            sourceRevision: 1,
+            disclosureRevision: 1,
+            expanded: false
+        )
+        let presentation = valid.disclosures.presentations[0]
+        let duplicate = TranscriptGeometryTarget(
+            items: valid.items,
+            sizes: valid.sizes,
+            bottomInset: valid.bottomInset,
+            effectiveWidth: valid.effectiveWidth,
+            viewportIntent: valid.viewportIntent,
+            sessionID: valid.sessionID,
+            disclosures: TranscriptDisclosureGeometryState(
+                presentations: [presentation, presentation]
+            )
+        )
+        let missingOwner = TranscriptGeometryTarget(
+            items: valid.items,
+            sizes: valid.sizes,
+            bottomInset: valid.bottomInset,
+            effectiveWidth: valid.effectiveWidth,
+            viewportIntent: valid.viewportIntent,
+            sessionID: valid.sessionID,
+            disclosures: TranscriptDisclosureGeometryState(presentations: [.init(
+                id: presentation.id,
+                ownerItemID: "missing",
+                revision: presentation.revision,
+                isExpanded: presentation.isExpanded
+            )])
+        )
+        let staleRevision = TranscriptGeometryTarget(
+            items: valid.items,
+            sizes: valid.sizes,
+            bottomInset: valid.bottomInset,
+            effectiveWidth: valid.effectiveWidth,
+            viewportIntent: valid.viewportIntent,
+            sessionID: valid.sessionID,
+            disclosures: TranscriptDisclosureGeometryState(presentations: [.init(
+                id: presentation.id,
+                ownerItemID: presentation.ownerItemID,
+                revision: presentation.revision + 1,
+                isExpanded: presentation.isExpanded
+            )])
+        )
+
+        #expect(!duplicate.hasValidDisclosureProvenance)
+        #expect(!missingOwner.hasValidDisclosureProvenance)
+        #expect(!staleRevision.hasValidDisclosureProvenance)
+        var state = TranscriptGeometryTransactionState(committed: valid)
+        #expect(state.submit(duplicate) == nil)
+        #expect(state.submit(missingOwner) == nil)
+        #expect(state.submit(staleRevision) == nil)
+    }
+
+    @Test func nested_tool_disclosure_invalidates_exactly_the_owning_details_row() {
+        let collapsed = disclosureTarget(
+            sourceRevision: 1,
+            disclosureRevision: 1,
+            expanded: true,
+            nestedToolExpanded: false
+        )
+        let expanded = disclosureTarget(
+            sourceRevision: 1,
+            disclosureRevision: 2,
+            expanded: true,
+            nestedToolExpanded: true
+        )
+
+        let plan = TranscriptGeometryMutationPlan.between(
+            previous: collapsed,
+            current: expanded
+        )
+        #expect(!plan.reloadsAllItems)
+        #expect(plan.changedIDs == ["working-details"])
+        #expect(plan.insertedIDs.isEmpty)
+        #expect(plan.deletedIDs.isEmpty)
+    }
+
+    @Test func unrelated_streaming_targets_retain_the_latest_user_disclosure_intent() throws {
+        var state = TranscriptGeometryTransactionState(committed: disclosureTarget(
+            sourceRevision: 1,
+            disclosureRevision: 1,
+            expanded: false
+        ))
+        _ = state.submit(disclosureTarget(
+            sourceRevision: 1,
+            disclosureRevision: 2,
+            expanded: true
+        ))
+        let disclosureValue = state.beginIfReady()
+        let disclosure = try #require(disclosureValue)
+        _ = state.submit(disclosureTarget(
+            sourceRevision: 2,
+            disclosureRevision: 2,
+            expanded: true
+        ))
+
+        _ = state.complete(
+            transactionGeneration: disclosure.generation,
+            completionProvenance: disclosure.completionProvenance,
+            currentUserIntentRevision: 1
+        )
+        let streamingValue = state.beginIfReady()
+        let streaming = try #require(streamingValue)
+        #expect(streaming.target.disclosures.presentation(for: "working")?.isExpanded == true)
+        #expect(streaming.target.items.map(\.id) == ["working", "working-details"])
+    }
+
     @Test func one_in_flight_transaction_coalesces_the_latest_full_intent() throws {
         var state = TranscriptGeometryTransactionState(committed: target(sourceRevision: 1))
 
@@ -23,6 +252,7 @@ struct TranscriptGeometryTransactionTests {
 
         let completion = state.complete(
             transactionGeneration: first.generation,
+            completionProvenance: first.completionProvenance,
             currentUserIntentRevision: 1
         )
         #expect(completion.viewportEffect == nil)
@@ -42,6 +272,7 @@ struct TranscriptGeometryTransactionTests {
 
         let stale = state.complete(
             transactionGeneration: transaction.generation + 99,
+            completionProvenance: transaction.completionProvenance,
             currentUserIntentRevision: 1
         )
         #expect(stale == .stale)
@@ -50,6 +281,7 @@ struct TranscriptGeometryTransactionTests {
         _ = state.submit(target(sourceRevision: 3, viewportRevision: 2))
         let old = state.complete(
             transactionGeneration: transaction.generation,
+            completionProvenance: transaction.completionProvenance,
             currentUserIntentRevision: 2
         )
         #expect(old.viewportEffect == nil)
@@ -126,6 +358,7 @@ struct TranscriptGeometryTransactionTests {
 
         let oldCompletion = state.complete(
             transactionGeneration: first.generation,
+            completionProvenance: first.completionProvenance,
             currentUserIntentRevision: 1
         )
         #expect(oldCompletion.viewportEffect == nil)
@@ -146,6 +379,7 @@ struct TranscriptGeometryTransactionTests {
         #expect(state.beginIfReady() == nil)
         let activeCompletion = state.complete(
             transactionGeneration: active.generation,
+            completionProvenance: active.completionProvenance,
             currentUserIntentRevision: 1
         )
         #expect(activeCompletion.viewportEffect == nil)
@@ -155,6 +389,7 @@ struct TranscriptGeometryTransactionTests {
         #expect(settlement.target.sizes["output"]?.renderPublicationVersion == 3)
         let settlementCompletion = state.complete(
             transactionGeneration: settlement.generation,
+            completionProvenance: settlement.completionProvenance,
             currentUserIntentRevision: 1
         )
         #expect(settlementCompletion.viewportEffect == .followTail)
@@ -176,6 +411,7 @@ struct TranscriptGeometryTransactionTests {
         let anchoredSettlement = try #require(anchoredSettlementValue)
         let anchoredCompletion = anchored.complete(
             transactionGeneration: anchoredSettlement.generation,
+            completionProvenance: anchoredSettlement.completionProvenance,
             currentUserIntentRevision: 4
         )
         #expect(anchoredCompletion.viewportEffect == .preserve(anchor))
@@ -243,6 +479,153 @@ struct TranscriptGeometryTransactionTests {
     }
 
 #if os(macOS)
+    @Test @MainActor func mounted_disclosure_chrome_children_height_and_anchor_commit_together() throws {
+        let driver = ManualTranscriptGeometryDrivers()
+        let scrollController = TranscriptScrollController()
+        let controller = NSHostingController(rootView: disclosureTranscriptView(
+            outerExpanded: false,
+            outerRevision: 1,
+            nestedExpanded: false,
+            nestedRevision: 1,
+            scrollController: scrollController,
+            driver: driver
+        ))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 640, height: 220),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        layout(window: window, controller: controller)
+        let collection = try #require(descendant(
+            of: NativeTranscriptCollectionNSView.self,
+            in: controller.view
+        ))
+        let scrollView = try #require(collection.enclosingScrollView)
+        let mountedFrame = NSRect(x: 0, y: 0, width: 640, height: 220)
+        controller.view.frame = mountedFrame
+        scrollView.frame = controller.view.bounds
+        scrollView.layoutSubtreeIfNeeded()
+        collection.frame = mountedFrame
+        NotificationCenter.default.post(
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+        for _ in 0..<4 {
+            controller.view.frame = mountedFrame
+            scrollView.frame = controller.view.bounds
+            scrollView.contentView.frame = scrollView.bounds
+            collection.frame = mountedFrame
+            layout(window: window, controller: controller)
+            driver.drainAll()
+        }
+        layout(window: window, controller: controller)
+        let coordinator = try #require(
+            collection.delegate as? NativeTranscriptCollectionView.Coordinator
+        )
+        try #require(collection.numberOfItems(inSection: 0) == 1)
+        #expect(coordinator.committedDisclosurePresentation(id: "working")?.isExpanded == false)
+        let initialHeader = try #require(collection.layoutAttributesForItem(
+            at: IndexPath(item: 0, section: 0)
+        ))
+        let headerOffset = initialHeader.frame.minY - scrollView.documentVisibleRect.minY
+
+        controller.rootView = disclosureTranscriptView(
+            outerExpanded: true,
+            outerRevision: 2,
+            nestedExpanded: false,
+            nestedRevision: 1,
+            scrollController: scrollController,
+            driver: driver
+        )
+        layout(window: window, controller: controller)
+        driver.releasePreparation()
+        #expect(coordinator.committedDisclosurePresentation(id: "working")?.isExpanded == false)
+        #expect(collection.numberOfItems(inSection: 0) == 1)
+        #expect(driver.mutations.count == 1)
+        driver.releaseMutation()
+        layout(window: window, controller: controller)
+        #expect(coordinator.committedDisclosurePresentation(id: "working")?.isExpanded == true)
+        #expect(collection.numberOfItems(inSection: 0) == 2)
+        let expandedDetailsSize = coordinator.collectionView(
+            collection,
+            layout: collection.collectionViewLayout!,
+            sizeForItemAt: IndexPath(item: 1, section: 0)
+        )
+        #expect(expandedDetailsSize.height > 20)
+        driver.releaseCompletion()
+        layout(window: window, controller: controller)
+        let expandedHeader = try #require(collection.layoutAttributesForItem(
+            at: IndexPath(item: 0, section: 0)
+        ))
+        #expect(abs(
+            expandedHeader.frame.minY - scrollView.documentVisibleRect.minY - headerOffset
+        ) <= 1)
+
+        controller.rootView = disclosureTranscriptView(
+            outerExpanded: true,
+            outerRevision: 2,
+            nestedExpanded: true,
+            nestedRevision: 2,
+            scrollController: scrollController,
+            driver: driver
+        )
+        layout(window: window, controller: controller)
+        driver.releasePreparation()
+        #expect(coordinator.committedDisclosurePresentation(id: "tool:tool-1")?.isExpanded == false)
+        let collapsedToolSize = coordinator.collectionView(
+            collection,
+            layout: collection.collectionViewLayout!,
+            sizeForItemAt: IndexPath(item: 1, section: 0)
+        )
+        driver.releaseMutation()
+        layout(window: window, controller: controller)
+        #expect(coordinator.lastReconfiguredItemIDs == ["working-details"])
+        #expect(coordinator.committedDisclosurePresentation(id: "tool:tool-1")?.isExpanded == true)
+        let expandedToolSize = coordinator.collectionView(
+            collection,
+            layout: collection.collectionViewLayout!,
+            sizeForItemAt: IndexPath(item: 1, section: 0)
+        )
+        #expect(expandedToolSize.height > collapsedToolSize.height)
+        let headerFrame = try #require(collection.layoutAttributesForItem(
+            at: IndexPath(item: 0, section: 0)
+        )).frame
+        let detailsFrame = try #require(collection.layoutAttributesForItem(
+            at: IndexPath(item: 1, section: 0)
+        )).frame
+        #expect(headerFrame.maxY <= detailsFrame.minY)
+        driver.releaseCompletion()
+
+        controller.rootView = disclosureTranscriptView(
+            outerExpanded: false,
+            outerRevision: 3,
+            nestedExpanded: true,
+            nestedRevision: 2,
+            scrollController: scrollController,
+            driver: driver
+        )
+        layout(window: window, controller: controller)
+        driver.releasePreparation()
+        #expect(collection.numberOfItems(inSection: 0) == 2)
+        #expect(coordinator.committedDisclosurePresentation(id: "working")?.isExpanded == true)
+        driver.releaseMutation()
+        layout(window: window, controller: controller)
+        #expect(collection.numberOfItems(inSection: 0) == 1)
+        #expect(coordinator.committedDisclosurePresentation(id: "working")?.isExpanded == false)
+        driver.releaseCompletion()
+        layout(window: window, controller: controller)
+        let collapsedHeader = try #require(collection.layoutAttributesForItem(
+            at: IndexPath(item: 0, section: 0)
+        ))
+        #expect(abs(
+            collapsedHeader.frame.minY - scrollView.documentVisibleRect.minY - headerOffset
+        ) <= 1)
+    }
+
     @Test func collection_width_transition_is_valid_during_expansion_and_shrink() {
         let horizontalInset: CGFloat = 36
         let expansion = NativeTranscriptCollectionWidthTransition(
@@ -387,6 +770,7 @@ struct TranscriptGeometryTransactionTests {
         #expect(tail.target.viewportIntent.anchor == nil)
         let tailCompletion = state.complete(
             transactionGeneration: tail.generation,
+            completionProvenance: tail.completionProvenance,
             currentUserIntentRevision: 4
         )
         #expect(tailCompletion.viewportEffect == .followTail)
@@ -401,6 +785,7 @@ struct TranscriptGeometryTransactionTests {
         let away = try #require(awayValue)
         let stale = state.complete(
             transactionGeneration: away.generation,
+            completionProvenance: away.completionProvenance,
             currentUserIntentRevision: 6
         )
         #expect(stale.viewportEffect == nil)
@@ -997,6 +1382,74 @@ struct TranscriptGeometryTransactionTests {
         )
     }
 
+    private func disclosureTarget(
+        sourceRevision: Int,
+        disclosureRevision: Int,
+        expanded: Bool,
+        nestedToolExpanded: Bool? = nil
+    ) -> TranscriptGeometryTarget {
+        let outerDisclosureRevision = nestedToolExpanded == nil ? disclosureRevision : 1
+        let header = TranscriptGeometryItem(
+            id: "working",
+            contentRevision: sourceRevision,
+            layoutRevision: outerDisclosureRevision,
+            heightAuthority: .synchronousHosting
+        )
+        var items = [header]
+        var sizes = [
+            header.id: TranscriptGeometryItemSize(
+                itemID: header.id,
+                contentRevision: header.contentRevision,
+                layoutRevision: header.layoutRevision,
+                contentVersion: 0,
+                renderPublicationVersion: 0,
+                effectiveWidth: 400,
+                height: 28
+            ),
+        ]
+        var presentations = [TranscriptDisclosureGeometryPresentation(
+            id: "working",
+            ownerItemID: "working",
+            revision: outerDisclosureRevision,
+            isExpanded: expanded
+        )]
+        if expanded {
+            let details = TranscriptGeometryItem(
+                id: "working-details",
+                contentRevision: sourceRevision,
+                layoutRevision: nestedToolExpanded == nil ? 0 : disclosureRevision,
+                heightAuthority: .synchronousHosting
+            )
+            items.append(details)
+            sizes[details.id] = TranscriptGeometryItemSize(
+                itemID: details.id,
+                contentRevision: details.contentRevision,
+                layoutRevision: details.layoutRevision,
+                contentVersion: 0,
+                renderPublicationVersion: 0,
+                effectiveWidth: 400,
+                height: nestedToolExpanded == true ? 180 : 64
+            )
+            if let nestedToolExpanded {
+                presentations.append(TranscriptDisclosureGeometryPresentation(
+                    id: "tool:tool-1",
+                    ownerItemID: details.id,
+                    revision: disclosureRevision,
+                    isExpanded: nestedToolExpanded
+                ))
+            }
+        }
+        return TranscriptGeometryTarget(
+            items: items,
+            sizes: sizes,
+            bottomInset: 40,
+            effectiveWidth: 400,
+            viewportIntent: .init(revision: 1, mode: .followTail),
+            sessionID: "session",
+            disclosures: TranscriptDisclosureGeometryState(presentations: presentations)
+        )
+    }
+
     private func item(
         _ id: String,
         revision: Int,
@@ -1096,6 +1549,54 @@ struct TranscriptGeometryTransactionTests {
     }
 
     @MainActor
+    private func disclosureTranscriptView(
+        outerExpanded: Bool,
+        outerRevision: Int,
+        nestedExpanded: Bool,
+        nestedRevision: Int,
+        scrollController: TranscriptScrollController,
+        driver: ManualTranscriptGeometryDrivers
+    ) -> NativeTranscriptCollectionView {
+        var items = [NativeTranscriptItem(
+            id: "working",
+            contentRevision: 1,
+            layoutRevision: outerRevision
+        )]
+        var presentations = [TranscriptDisclosureGeometryPresentation(
+            id: "working",
+            ownerItemID: "working",
+            revision: outerRevision,
+            isExpanded: outerExpanded
+        )]
+        if outerExpanded {
+            items.append(NativeTranscriptItem(
+                id: "working-details",
+                contentRevision: 1,
+                layoutRevision: nestedRevision
+            ))
+            presentations.append(TranscriptDisclosureGeometryPresentation(
+                id: "tool:tool-1",
+                ownerItemID: "working-details",
+                revision: nestedRevision,
+                isExpanded: nestedExpanded
+            ))
+        }
+        return NativeTranscriptCollectionView(
+            items: items,
+            sessionID: "disclosure-session",
+            outputRevision: "stable-output",
+            bottomInset: 0,
+            disclosures: TranscriptDisclosureGeometryState(presentations: presentations),
+            scrollController: scrollController,
+            geometryDrivers: driver.value
+        ) { index in
+            AnyView(GeometryDisclosureProbe(
+                kind: index == 0 ? .header : .details
+            ))
+        }
+    }
+
+    @MainActor
     private func waitForGeometry(
         _ label: String = "geometry",
         timeout: Duration = .seconds(2),
@@ -1182,6 +1683,38 @@ struct TranscriptGeometryTransactionTests {
 }
 
 #if os(macOS)
+private struct GeometryDisclosureProbe: View {
+    enum Kind {
+        case header
+        case details
+    }
+
+    @Environment(\.nativeTranscriptDisclosureContext) private var disclosureContext
+    let kind: Kind
+
+    var body: some View {
+        switch kind {
+        case .header:
+            Text(disclosureContext?.isExpanded(id: "working", fallback: false) == true
+                ? "Working expanded"
+                : "Working collapsed")
+                .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+        case .details:
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Tool")
+                if disclosureContext?.isExpanded(id: "tool:tool-1", fallback: false) == true {
+                    ForEach(0..<12, id: \.self) { index in
+                        Text("Tool output \(index)")
+                    }
+                } else {
+                    Text("Collapsed tool")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
 @MainActor
 private final class ManualTranscriptGeometryDrivers {
     private(set) var preparations: [@MainActor () -> Void] = []

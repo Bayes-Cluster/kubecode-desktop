@@ -154,6 +154,7 @@ private struct TranscriptViewport: View {
     let renderStore: AgentMarkdownRenderStore
     let outputRevision: String
     let bottomInset: CGFloat
+    let disclosures: TranscriptDisclosureGeometryState
     let scrollController: TranscriptScrollController
     let heightAuthority: (TranscriptSurfaceEntry) -> NativeTranscriptHeightAuthority
     let layoutRevision: (String) -> Int
@@ -174,6 +175,7 @@ private struct TranscriptViewport: View {
             sessionID: sessionID,
             outputRevision: outputRevision,
             bottomInset: bottomInset,
+            disclosures: disclosures,
             scrollController: scrollController
         ) { index in
             guard entries.indices.contains(index) else { return AnyView(EmptyView()) }
@@ -1671,6 +1673,7 @@ struct ContentView: View {
                     renderStore: sessionWorkspace.markdownRenderStore,
                     outputRevision: transcriptScrollMarker,
                     bottomInset: transcriptBottomClearance,
+                    disclosures: transcriptDisclosureGeometryState,
                     scrollController: sessionWorkspace.transcriptScrollController,
                     heightAuthority: transcriptSurfaceHeightAuthority,
                     layoutRevision: { ownerID in
@@ -2225,6 +2228,7 @@ struct ContentView: View {
         case let .activityHeader(activity):
             RunActivityHeaderRow(
                 activity: activity,
+                disclosureID: activity.id,
                 isExpanded: transcriptExpansionBinding(
                     for: activity.id,
                     ownerID: activity.id,
@@ -2257,6 +2261,64 @@ struct ContentView: View {
             activity: activity,
             showsAllSteps: showsAll
         )
+    }
+
+    private var transcriptDisclosureGeometryState: TranscriptDisclosureGeometryState {
+        var state = TranscriptDisclosureGeometryState.empty
+        let sessionID = model.selectedConversationID
+        for entry in transcriptSurfaceEntries {
+            switch entry {
+            case let .activityHeader(activity):
+                state.replace(TranscriptDisclosureGeometryPresentation(
+                    id: activity.id,
+                    ownerItemID: activity.id,
+                    revision: sessionWorkspace.transcriptLayoutRevision(
+                        sessionID: sessionID,
+                        ownerID: activity.id
+                    ),
+                    isExpanded: sessionWorkspace.resolvedTranscriptExpansion(
+                        sessionID: sessionID,
+                        itemID: activity.id,
+                        defaultExpanded: activity.defaultExpanded
+                    )
+                ))
+            case let .activityDetails(details):
+                let ownerID = details.id
+                let revision = sessionWorkspace.transcriptLayoutRevision(
+                    sessionID: sessionID,
+                    ownerID: ownerID
+                )
+                for step in details.steps {
+                    state.replace(TranscriptDisclosureGeometryPresentation(
+                        id: step.identity.id,
+                        ownerItemID: ownerID,
+                        revision: revision,
+                        isExpanded: sessionWorkspace.isTranscriptExpanded(
+                            sessionID: sessionID,
+                            identity: step.identity
+                        )
+                    ))
+                }
+            case let .item(item):
+                guard let kind = TranscriptDisclosureKind(role: item.role) else { continue }
+                let identity = TranscriptDisclosureIdentity(itemID: item.id, kind: kind)
+                state.replace(TranscriptDisclosureGeometryPresentation(
+                    id: identity.id,
+                    ownerItemID: item.id,
+                    revision: sessionWorkspace.transcriptLayoutRevision(
+                        sessionID: sessionID,
+                        ownerID: item.id
+                    ),
+                    isExpanded: sessionWorkspace.isTranscriptExpanded(
+                        sessionID: sessionID,
+                        identity: identity
+                    )
+                ))
+            case .revisionWarning, .loadEarlier, .runOutput, .sideQuestion:
+                continue
+            }
+        }
+        return state
     }
 
     private func activityDetailsRow(
@@ -2347,12 +2409,14 @@ struct ContentView: View {
             ThinkingTranscriptRow(
                 item: item,
                 isCurrent: isCurrent,
+                disclosureID: identity.id,
                 isExpanded: transcriptExpansionBinding(for: identity, ownerID: ownerID)
             )
         case .tool:
             ToolUseTranscriptRow(
                 item: item,
                 isCurrent: isCurrent,
+                disclosureID: identity.id,
                 isExpanded: transcriptExpansionBinding(for: identity, ownerID: ownerID)
             )
         case .agent:
@@ -2405,6 +2469,10 @@ struct ContentView: View {
             ThinkingTranscriptRow(
                 item: item,
                 isCurrent: model.activeRun?.id == item.runID,
+                disclosureID: TranscriptDisclosureIdentity(
+                    itemID: item.id,
+                    kind: .thinking
+                ).id,
                 isExpanded: transcriptExpansionBinding(
                     for: TranscriptDisclosureIdentity(itemID: item.id, kind: .thinking),
                     ownerID: item.id
@@ -2414,6 +2482,10 @@ struct ContentView: View {
             ToolUseTranscriptRow(
                 item: item,
                 isCurrent: model.activeRun?.id == item.runID,
+                disclosureID: TranscriptDisclosureIdentity(
+                    itemID: item.id,
+                    kind: .tool
+                ).id,
                 isExpanded: transcriptExpansionBinding(
                     for: TranscriptDisclosureIdentity(itemID: item.id, kind: .tool),
                     ownerID: item.id
@@ -3594,21 +3666,29 @@ private struct UserMessageBubble: View {
 }
 
 private struct TranscriptDisclosureGroup<Label: View, Content: View>: View {
+    @Environment(\.nativeTranscriptDisclosureContext) private var disclosureContext
     @Binding var isExpanded: Bool
+    let disclosureID: String
     private let content: () -> Content
     private let label: () -> Label
 
     init(
+        disclosureID: String,
         isExpanded: Binding<Bool>,
         @ViewBuilder content: @escaping () -> Content,
         @ViewBuilder label: @escaping () -> Label
     ) {
+        self.disclosureID = disclosureID
         _isExpanded = isExpanded
         self.content = content
         self.label = label
     }
 
     var body: some View {
+        let presentedExpanded = disclosureContext?.isExpanded(
+            id: disclosureID,
+            fallback: isExpanded
+        ) ?? isExpanded
         VStack(alignment: .leading, spacing: 0) {
             Button {
                 var transaction = Transaction()
@@ -3621,15 +3701,14 @@ private struct TranscriptDisclosureGroup<Label: View, Content: View>: View {
                     Image(systemName: "chevron.right")
                         .font(.caption2.weight(.semibold))
                         .frame(width: 10, height: 12)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .animation(.easeOut(duration: 0.12), value: isExpanded)
+                        .rotationEffect(.degrees(presentedExpanded ? 90 : 0))
                     label()
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
-            if isExpanded {
+            if presentedExpanded {
                 content()
                     .transition(.identity)
                     .transaction { $0.animation = nil }
@@ -3641,16 +3720,23 @@ private struct TranscriptDisclosureGroup<Label: View, Content: View>: View {
 private struct ThinkingTranscriptRow: View {
     let item: TranscriptItem
     let isCurrent: Bool
+    let disclosureID: String
     @Binding var isExpanded: Bool
 
-    init(item: TranscriptItem, isCurrent: Bool, isExpanded: Binding<Bool>) {
+    init(
+        item: TranscriptItem,
+        isCurrent: Bool,
+        disclosureID: String,
+        isExpanded: Binding<Bool>
+    ) {
         self.item = item
         self.isCurrent = isCurrent
+        self.disclosureID = disclosureID
         _isExpanded = isExpanded
     }
 
     var body: some View {
-        TranscriptDisclosureGroup(isExpanded: $isExpanded) {
+        TranscriptDisclosureGroup(disclosureID: disclosureID, isExpanded: $isExpanded) {
             AgentMarkdownView(
                 source: item.text,
                 tone: .secondary,
@@ -3686,15 +3772,21 @@ private struct ThinkingTranscriptRow: View {
 }
 
 private struct RunActivityHeaderRow: View {
+    @Environment(\.nativeTranscriptDisclosureContext) private var disclosureContext
     let activity: TranscriptRunActivity
+    let disclosureID: String
     @Binding var isExpanded: Bool
 
     var body: some View {
+        let presentedExpanded = disclosureContext?.isExpanded(
+            id: disclosureID,
+            fallback: isExpanded
+        ) ?? isExpanded
         Button {
             isExpanded.toggle()
         } label: {
             HStack(spacing: 7) {
-                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                Image(systemName: presentedExpanded ? "chevron.down" : "chevron.right")
                     .font(.caption2.weight(.semibold))
                     .frame(width: 10)
                 activitySymbol
@@ -3760,20 +3852,23 @@ struct TranscriptActivityDisclosureState: Equatable {
 private struct ToolUseTranscriptRow: View {
     let item: TranscriptItem
     let isCurrent: Bool
+    let disclosureID: String
     @Binding var isExpanded: Bool
 
     init(
         item: TranscriptItem,
         isCurrent: Bool = false,
+        disclosureID: String,
         isExpanded: Binding<Bool>
     ) {
         self.item = item
         self.isCurrent = isCurrent
+        self.disclosureID = disclosureID
         _isExpanded = isExpanded
     }
 
     var body: some View {
-        TranscriptDisclosureGroup(isExpanded: $isExpanded) {
+        TranscriptDisclosureGroup(disclosureID: disclosureID, isExpanded: $isExpanded) {
             if let detail = item.detail, !detail.isEmpty {
                 NativeSelectableToolOutputView(source: detail)
                     .frame(maxWidth: .infinity, alignment: .leading)
