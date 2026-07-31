@@ -50,6 +50,17 @@ private actor ControlledStreamingMarkdownBuilder {
         ))
     }
 
+    func resumeBuild(at index: Int, returningSource source: String) {
+        guard let build = suspended.removeValue(forKey: index) else {
+            Issue.record("No suspended Markdown build at index \(index)")
+            return
+        }
+        build.continuation.resume(returning: StreamingMarkdownDocument(
+            source: source,
+            previous: build.previous
+        ))
+    }
+
     func waitForInvocationCount(_ expected: Int) async {
         if invocations.count >= expected { return }
         await withCheckedContinuation { continuation in
@@ -274,6 +285,46 @@ struct StreamingMarkdownSessionTests {
         #expect(await builder.recordedInvocations().count == 1)
         #expect(recorder.snapshots.map(\.generation) == [41])
         #expect(recorder.snapshots.map(\.contentVersion) == [1])
+    }
+
+    @Test @MainActor func failed_build_preserves_stable_prefix_and_exact_literal_tail_then_recovers() async throws {
+        let builder = ControlledStreamingMarkdownBuilder()
+        let scheduler = RecordingScheduler()
+        let recorder = StreamingPublicationRecorder()
+        let session = StreamingMarkdownSession(
+            builder: { await builder.build(source: $0, previous: $1) },
+            scheduler: scheduler.schedule,
+            onPublish: recorder.record
+        )
+        let committed = "# Stable\n\nComplete paragraph.\n\n"
+        let failedSource = committed + "```swift\nlet value = 1"
+        let recoveredSource = failedSource + "\n```"
+
+        _ = session.submit(source: committed, generation: 1)
+        await builder.waitForInvocationCount(1)
+        await builder.resumeBuild(at: 0)
+        await scheduler.tasks[0].value
+
+        _ = session.submit(source: failedSource, generation: 2)
+        await builder.waitForInvocationCount(2)
+        await builder.resumeBuild(at: 1, returningSource: "builder failure sentinel")
+        await scheduler.tasks[1].value
+
+        let failed = try #require(session.preparedSnapshot)
+        #expect(failed.source == failedSource)
+        #expect(failed.document.source == failedSource)
+        #expect(failed.document.stablePrefix.map(\.plainText) == ["Stable", "Complete paragraph."])
+        #expect(failed.document.mutableTail.last?.literalSource == "```swift\nlet value = 1")
+        #expect(recorder.snapshots.map(\.generation) == [1, 2])
+
+        _ = session.submit(source: recoveredSource, generation: 3)
+        await builder.waitForInvocationCount(3)
+        await builder.resumeBuild(at: 2)
+        await scheduler.tasks[2].value
+
+        #expect(session.preparedSnapshot?.source == recoveredSource)
+        #expect(session.preparedSnapshot?.document.blocks.last?.literalSource == nil)
+        #expect(session.scheduledWorkCount == 0)
     }
 
     @Test @MainActor func cancelled_session_does_not_publish() async {

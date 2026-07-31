@@ -619,6 +619,7 @@ struct ContentView: View {
     @Bindable var model: AppModel
     @Bindable var sessionWorkspace: SessionWorkspaceModel
     @Environment(\.workspaceTypography) private var typography
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var renamingConversation: Conversation?
     @State private var renameDraft = ""
     @State private var deletingConversation: Conversation?
@@ -2897,7 +2898,7 @@ struct ContentView: View {
         isExpanded: Binding<Bool>
     ) -> some View {
         Button {
-            withAnimation(.easeInOut(duration: ComposerPresentationMetrics.transitionDuration)) {
+            withAnimation(WorkspaceMotionPolicy(reduceMotion: reduceMotion).animation) {
                 isExpanded.wrappedValue.toggle()
             }
         } label: {
@@ -3434,7 +3435,7 @@ struct ContentView: View {
         .frame(height: 30)
         .contentShape(Rectangle())
         .animation(
-            .easeInOut(duration: ComposerPresentationMetrics.transitionDuration),
+            WorkspaceMotionPolicy(reduceMotion: reduceMotion).animation,
             value: isPresented
         )
     }
@@ -3478,7 +3479,7 @@ struct ContentView: View {
     }
 
     private func toggleComposerProviderControl(_ id: String) {
-        withAnimation(.easeInOut(duration: ComposerPresentationMetrics.transitionDuration)) {
+        withAnimation(WorkspaceMotionPolicy(reduceMotion: reduceMotion).animation) {
             sessionWorkspace.openComposerProviderControlID = sessionWorkspace.openComposerProviderControlID == id ? nil : id
         }
     }

@@ -39,6 +39,7 @@
 | [0033](adr/0033-stable-bounded-transcript-disclosures.md) | Accepted | Stable semantic identity and bounded native Working/Tool disclosure content |
 | [0034](adr/0034-atomic-disclosure-geometry-transactions.md) | Accepted | Atomic disclosure presentation and transcript geometry transactions |
 | [0035](adr/0035-latest-only-transcript-width-settlement.md) | Accepted | Latest-only versioned transcript width settlement |
+| [0036](adr/0036-mounted-transcript-release-acceptance.md) | Accepted | Mounted transcript release acceptance and interaction holds |
 
 Proposed ADRs are implementation-ready recommendations. Move one to Accepted
 before starting work that depends on its long-term boundary.

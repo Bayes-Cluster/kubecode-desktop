@@ -137,7 +137,16 @@ Copy Response exposes the exact raw Markdown through both its context menu and
 an accessibility custom action. Link projection and native activation both
 allow only HTTP, HTTPS, and mailto destinations. The persistent view retains
 selection and first responder across streaming, completion, attachment, and
-appearance refreshes.
+appearance refreshes. Selection inside the immutable stable prefix survives a
+compatible suffix commit. A selection intersecting the replaced mutable tail
+clamps to the new tail boundary. A mounted nonempty selection or native mouse
+drag synchronously invalidates follow-tail through the collection's existing
+user-intent revision; when the interaction ends, only the existing near-tail
+viewport policy may resume following. A failed off-main Markdown build
+publishes a source-preserving fallback document: the valid stable prefix
+remains committed and an unmatched fence or otherwise unsafe tail is rendered
+as exact selectable literal text. Missing image data retains selectable alt
+text, and unsupported math retains its source delimiters.
 One MainActor geometry driver retains one in-flight transaction and one
 replaceable latest full intent. It premeasures every target row, then commits the
 item projection, persistent row-builder configuration, scalar sizes, rounded
@@ -162,6 +171,12 @@ deterministic survivor fallback if it is deleted. Streaming never forces
 document-wide synchronous layout.
 Rendering acceptance interleaves sidebar resize, live scroll, and streaming
 growth rather than testing those operations sequentially.
+The final mounted acceptance also exercises selection and mouse drag,
+Working/Tool disclosure bursts, Composer wrapping and focus, build and
+attachment failure, Project/Session teardown, bounded stores, and Reduce
+Motion. Reduce Motion removes the remaining nonessential Explorer and Composer
+provider presentation animations without changing disclosure, rotation, or
+layout geometry.
 
 Each scene creates one `WindowWorkspaceModel`. It owns an independent
 `AppModel` plus stable Navigation, Session, Project, Team, Terminal, and window
