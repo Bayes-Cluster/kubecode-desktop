@@ -35,6 +35,7 @@
 | [0020](adr/0020-commonmark-gfm-and-latex-rendering.md) | Accepted | CommonMark, GFM, LaTeX, and bounded image rendering; supersedes ADR 0010 parser/streaming details |
 | [0021](adr/0021-seamless-navigator-information-hierarchy.md) | Accepted | Seamless Sessions, Plan, Changes, Files, and Runtime Navigator hierarchy |
 | [0022](adr/0022-composer-aware-transcript-layout.md) | Accepted | Measured composer obstruction and deterministic transcript row settlement |
+| [0033](adr/0033-stable-bounded-transcript-disclosures.md) | Accepted | Stable semantic identity and bounded native Working/Tool disclosure content |
 
 Proposed ADRs are implementation-ready recommendations. Move one to Accepted
 before starting work that depends on its long-term boundary.

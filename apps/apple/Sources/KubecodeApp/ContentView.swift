@@ -62,14 +62,49 @@ enum TranscriptSurfaceHeightAuthority {
     }
 }
 
+struct TranscriptActivityDetailsPresentation: Identifiable, Hashable {
+    struct Step: Identifiable, Hashable {
+        let identity: TranscriptDisclosureIdentity
+        let item: TranscriptItem
+        let isCurrent: Bool
+
+        var id: String { identity.id }
+    }
+
+    private static let recentStepLimit = 8
+
+    let activityID: String
+    let steps: [Step]
+    let hiddenStepCount: Int
+    let showsAllSteps: Bool
+
+    var id: String { "\(activityID)-details" }
+
+    init(activity: TranscriptRunActivity, showsAllSteps: Bool) {
+        activityID = activity.id
+        self.showsAllSteps = showsAllSteps
+        hiddenStepCount = activity.hiddenItemCount(limit: Self.recentStepLimit)
+        let visibleItems = showsAllSteps
+            ? activity.items
+            : activity.recentItems(limit: Self.recentStepLimit)
+        steps = visibleItems.compactMap { item in
+            guard let kind = TranscriptDisclosureKind(role: item.role) else { return nil }
+            return Step(
+                identity: TranscriptDisclosureIdentity(itemID: item.id, kind: kind),
+                item: item,
+                isCurrent: activity.isActive && item.id == activity.items.last?.id
+            )
+        }
+    }
+}
+
 private enum TranscriptSurfaceEntry: Identifiable, Hashable {
     case revisionWarning(String)
     case loadEarlier(isLoading: Bool)
     case item(TranscriptItem)
     case activityHeader(TranscriptRunActivity)
+    case activityDetails(TranscriptActivityDetailsPresentation)
     case runOutput(TranscriptRunOutput)
-    case activityStep(item: TranscriptItem, ownerID: String, isCurrent: Bool)
-    case activityLimit(ownerID: String, hiddenCount: Int, showsAll: Bool)
     case sideQuestion(SideQuestion)
 
     var id: String {
@@ -78,9 +113,8 @@ private enum TranscriptSurfaceEntry: Identifiable, Hashable {
         case .loadEarlier: "load-earlier"
         case let .item(item): item.id
         case let .activityHeader(activity): activity.id
+        case let .activityDetails(details): details.id
         case let .runOutput(output): output.id
-        case let .activityStep(item, ownerID, _): "\(ownerID)-step-\(item.id)"
-        case let .activityLimit(ownerID, _, _): "\(ownerID)-limit"
         case let .sideQuestion(question): "side-question-\(question.id)"
         }
     }
@@ -2147,7 +2181,9 @@ struct ContentView: View {
                     entries.append(.runOutput(output))
                 }
                 if let activity = run.activity {
-                    entries.append(contentsOf: activityDetailSurfaceEntries(activity))
+                    if let details = activityDetailsPresentation(activity) {
+                        entries.append(.activityDetails(details))
+                    }
                 }
                 entries.append(contentsOf: run.trailingItems.map(TranscriptSurfaceEntry.item))
             }
@@ -2187,67 +2223,73 @@ struct ContentView: View {
                     defaultExpanded: activity.defaultExpanded
                 )
             )
+        case let .activityDetails(details):
+            activityDetailsRow(details)
         case let .runOutput(output):
             TranscriptRunOutputRow(output: output)
-        case let .activityStep(item, ownerID, isCurrent):
-            activityStepRow(item, ownerID: ownerID, isCurrent: isCurrent)
-                .padding(.leading, 2)
-        case let .activityLimit(ownerID, hiddenCount, showsAll):
-            Button {
-                sessionWorkspace.setShowsAllTranscriptSteps(
-                    !showsAll,
-                    sessionID: model.selectedConversationID,
-                    ownerID: ownerID
-                )
-            } label: {
-                Text(showsAll
-                    ? String(localized: "Show recent only")
-                    : String(
-                        format: String(localized: "Show %lld earlier steps"),
-                        Int64(hiddenCount)
-                    ))
-            }
-            .buttonStyle(.plain)
-            .font(.caption)
-            .foregroundStyle(.secondary)
         case let .sideQuestion(question):
             sideQuestionCard(question)
         }
     }
 
-    private func activityDetailSurfaceEntries(
+    private func activityDetailsPresentation(
         _ activity: TranscriptRunActivity
-    ) -> [TranscriptSurfaceEntry] {
+    ) -> TranscriptActivityDetailsPresentation? {
         let ownerID = activity.id
-        var entries: [TranscriptSurfaceEntry] = []
         guard sessionWorkspace.resolvedTranscriptExpansion(
             sessionID: model.selectedConversationID,
             itemID: ownerID,
             defaultExpanded: activity.defaultExpanded
-        ) else { return entries }
-
-        let recentLimit = 8
+        ) else { return nil }
         let showsAll = sessionWorkspace.showsAllTranscriptSteps(
             sessionID: model.selectedConversationID,
             ownerID: ownerID
         )
-        let hiddenCount = activity.hiddenItemCount(limit: recentLimit)
-        if hiddenCount > 0 {
-            entries.append(.activityLimit(
-                ownerID: ownerID,
-                hiddenCount: hiddenCount,
-                showsAll: showsAll
-            ))
+        return TranscriptActivityDetailsPresentation(
+            activity: activity,
+            showsAllSteps: showsAll
+        )
+    }
+
+    private func activityDetailsRow(
+        _ details: TranscriptActivityDetailsPresentation
+    ) -> some View {
+        NativeBoundedTranscriptView(
+            maximumHeight: TranscriptDisclosureMetrics.workingMaximumHeight
+        ) {
+            VStack(alignment: .leading, spacing: 9) {
+                if details.hiddenStepCount > 0 {
+                    Button {
+                        sessionWorkspace.setShowsAllTranscriptSteps(
+                            !details.showsAllSteps,
+                            sessionID: model.selectedConversationID,
+                            ownerID: details.activityID,
+                            layoutOwnerID: details.id
+                        )
+                    } label: {
+                        Text(details.showsAllSteps
+                            ? String(localized: "Show recent only")
+                            : String(
+                                format: String(localized: "Show %lld earlier steps"),
+                                Int64(details.hiddenStepCount)
+                            ))
+                    }
+                    .buttonStyle(.plain)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                ForEach(details.steps) { step in
+                    activityStepRow(
+                        step.item,
+                        identity: step.identity,
+                        ownerID: details.id,
+                        isCurrent: step.isCurrent
+                    )
+                }
+            }
+            .padding(.leading, 2)
         }
-        let visible = showsAll ? activity.items : activity.recentItems(limit: recentLimit)
-        entries.append(contentsOf: visible.map { item in
-            .activityStep(
-                item: item,
-                ownerID: ownerID,
-                isCurrent: activity.isActive && item.id == activity.items.last?.id
-            )
-        })
-        return entries
     }
 
     private func transcriptSurfaceHeightAuthority(
@@ -2258,26 +2300,13 @@ struct ContentView: View {
             return .versionedRender
         case let .item(item):
             let expanded = item.role == .thinking
-                && sessionWorkspace.resolvedTranscriptExpansion(
+                && sessionWorkspace.isTranscriptExpanded(
                     sessionID: model.selectedConversationID,
-                    itemID: item.id,
-                    defaultExpanded: false
+                    identity: TranscriptDisclosureIdentity(itemID: item.id, kind: .thinking)
                 )
             return TranscriptSurfaceHeightAuthority.resolve(
                 role: item.role,
                 presentation: .transcriptItem,
-                isExpanded: expanded
-            )
-        case let .activityStep(item, _, _):
-            let expanded = item.role == .thinking
-                && sessionWorkspace.resolvedTranscriptExpansion(
-                    sessionID: model.selectedConversationID,
-                    itemID: item.id,
-                    defaultExpanded: false
-                )
-            return TranscriptSurfaceHeightAuthority.resolve(
-                role: item.role,
-                presentation: .activityStep,
                 isExpanded: expanded
             )
         default:
@@ -2301,6 +2330,7 @@ struct ContentView: View {
     @ViewBuilder
     private func activityStepRow(
         _ item: TranscriptItem,
+        identity: TranscriptDisclosureIdentity,
         ownerID: String,
         isCurrent: Bool
     ) -> some View {
@@ -2309,13 +2339,13 @@ struct ContentView: View {
             ThinkingTranscriptRow(
                 item: item,
                 isCurrent: isCurrent,
-                isExpanded: transcriptExpansionBinding(for: item.id, ownerID: ownerID)
+                isExpanded: transcriptExpansionBinding(for: identity, ownerID: ownerID)
             )
         case .tool:
             ToolUseTranscriptRow(
                 item: item,
                 isCurrent: isCurrent,
-                isExpanded: transcriptExpansionBinding(for: item.id, ownerID: ownerID)
+                isExpanded: transcriptExpansionBinding(for: identity, ownerID: ownerID)
             )
         case .agent:
             VStack(alignment: .leading, spacing: 5) {
@@ -2363,13 +2393,19 @@ struct ContentView: View {
             ThinkingTranscriptRow(
                 item: item,
                 isCurrent: model.activeRun?.id == item.runID,
-                isExpanded: transcriptExpansionBinding(for: item.id, ownerID: item.id)
+                isExpanded: transcriptExpansionBinding(
+                    for: TranscriptDisclosureIdentity(itemID: item.id, kind: .thinking),
+                    ownerID: item.id
+                )
             )
         case .tool:
             ToolUseTranscriptRow(
                 item: item,
                 isCurrent: model.activeRun?.id == item.runID,
-                isExpanded: transcriptExpansionBinding(for: item.id, ownerID: item.id)
+                isExpanded: transcriptExpansionBinding(
+                    for: TranscriptDisclosureIdentity(itemID: item.id, kind: .tool),
+                    ownerID: item.id
+                )
             )
         case .system:
             VStack(alignment: .leading, spacing: 5) {
@@ -2448,18 +2484,22 @@ struct ContentView: View {
         )
     }
 
-    private func transcriptShowsAllStepsBinding(ownerID: String) -> Binding<Bool> {
+    private func transcriptExpansionBinding(
+        for identity: TranscriptDisclosureIdentity,
+        ownerID: String
+    ) -> Binding<Bool> {
         Binding(
             get: {
-                sessionWorkspace.showsAllTranscriptSteps(
+                sessionWorkspace.isTranscriptExpanded(
                     sessionID: model.selectedConversationID,
-                    ownerID: ownerID
+                    identity: identity
                 )
             },
-            set: { showsAll in
-                sessionWorkspace.setShowsAllTranscriptSteps(
-                    showsAll,
+            set: { expanded in
+                sessionWorkspace.setTranscriptExpanded(
+                    expanded,
                     sessionID: model.selectedConversationID,
+                    identity: identity,
                     ownerID: ownerID
                 )
             }
@@ -3691,136 +3731,6 @@ private struct RunActivityHeaderRow: View {
     }
 }
 
-private struct RunActivityTranscriptRow: View {
-    private static let recentStepLimit = 8
-
-    let activity: TranscriptRunActivity
-    @Binding var isExpanded: Bool
-    @Binding var showsAllSteps: Bool
-    let expansionBindingForItem: (String) -> Binding<Bool>
-
-    var body: some View {
-        TranscriptDisclosureGroup(isExpanded: $isExpanded) {
-            VStack(alignment: .leading, spacing: 9) {
-                if hiddenStepCount > 0, !showsAllSteps {
-                    Button {
-                        showsAllSteps = true
-                    } label: {
-                        Text(String(
-                            format: String(localized: "Show %lld earlier steps"),
-                            Int64(hiddenStepCount)
-                        ))
-                    }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                } else if activity.items.count > Self.recentStepLimit, showsAllSteps {
-                    Button("Show recent only") {
-                        showsAllSteps = false
-                    }
-                    .buttonStyle(.plain)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-
-                ForEach(visibleItems) { item in
-                    activityStep(item, isCurrent: activity.isActive && item.id == activity.items.last?.id)
-                }
-            }
-            .padding(.top, 7)
-            .padding(.leading, 2)
-        } label: {
-            HStack(spacing: 7) {
-                activitySymbol
-                Text(activityLabel)
-                    .lineLimit(1)
-            }
-            .font(.caption.weight(.semibold))
-            .foregroundStyle(activity.status == "failed" ? .red : .secondary)
-        }
-        .frame(maxWidth: 760, alignment: .leading)
-    }
-
-    @ViewBuilder
-    private func activityStep(_ item: TranscriptItem, isCurrent: Bool) -> some View {
-        switch item.role {
-        case .thinking:
-            ThinkingTranscriptRow(
-                item: item,
-                isCurrent: isCurrent,
-                isExpanded: expansionBindingForItem(item.id)
-            )
-        case .tool:
-            ToolUseTranscriptRow(
-                item: item,
-                isCurrent: isCurrent,
-                isExpanded: expansionBindingForItem(item.id)
-            )
-        case .agent:
-            VStack(alignment: .leading, spacing: 5) {
-                Label("Update", systemImage: "text.bubble")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                AgentMarkdownView(source: item.text, tone: .secondary)
-                    .frame(maxWidth: 720, alignment: .leading)
-            }
-        case .user, .system, .status:
-            EmptyView()
-        }
-    }
-
-    @ViewBuilder
-    private var activitySymbol: some View {
-        if activity.isActive {
-            ProgressView().controlSize(.mini)
-        } else if activity.status == "completed" {
-            Image(systemName: "checkmark.circle")
-        } else if activity.status != nil {
-            Image(systemName: "exclamationmark.circle")
-        } else {
-            Image(systemName: "sparkles")
-        }
-    }
-
-    private var visibleItems: [TranscriptItem] {
-        showsAllSteps ? activity.items : activity.recentItems(limit: Self.recentStepLimit)
-    }
-
-    private var hiddenStepCount: Int {
-        activity.hiddenItemCount(limit: Self.recentStepLimit)
-    }
-
-    private var activityLabel: String {
-        let title: String
-        if activity.isActive {
-            title = String(localized: "Working")
-        } else if activity.status == "completed" {
-            title = String(localized: "Worked")
-        } else if activity.status != nil {
-            title = String(localized: "Stopped")
-        } else {
-            title = String(localized: "Activity")
-        }
-        let steps = stepCountLabel
-        guard activity.toolCount > 0 else { return "\(title) · \(steps)" }
-        return "\(title) · \(steps) · \(toolCountLabel)"
-    }
-
-    private var stepCountLabel: String {
-        let unit = activity.stepCount == 1
-            ? String(localized: "step")
-            : String(localized: "steps")
-        return "\(activity.stepCount) \(unit)"
-    }
-
-    private var toolCountLabel: String {
-        let unit = activity.toolCount == 1
-            ? String(localized: "tool")
-            : String(localized: "tools")
-        return "\(activity.toolCount) \(unit)"
-    }
-}
-
 struct TranscriptActivityDisclosureState: Equatable {
     private(set) var userValue: Bool?
 
@@ -3851,11 +3761,8 @@ private struct ToolUseTranscriptRow: View {
     var body: some View {
         TranscriptDisclosureGroup(isExpanded: $isExpanded) {
             if let detail = item.detail, !detail.isEmpty {
-                Text(detail)
-                    .font(.system(.caption, design: .monospaced))
-                    .textSelection(.enabled)
+                NativeSelectableToolOutputView(source: detail)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 6)
             }
         } label: {
