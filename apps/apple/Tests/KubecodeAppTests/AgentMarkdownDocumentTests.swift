@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import KubecodeApp
 
@@ -171,6 +172,19 @@ struct AgentMarkdownDocumentTests {
         #expect(runs.contains { $0.text == "removed" && $0.traits.contains(.strikethrough) })
         #expect(runs.contains { $0.text == "code" && $0.traits.contains(.code) })
         #expect(runs.contains { $0.text == "Swift" && $0.destination?.absoluteString == "https://swift.org" })
+    }
+
+    @Test func link_policy_rejects_unsafe_schemes_at_projection_and_activation_boundaries() {
+        let document = AgentMarkdownDocument(
+            source: "[web](https://example.com) [mail](mailto:team@example.com) "
+                + "[file](file:///tmp/secret) [script](javascript:alert(1))"
+        )
+        let destinations = document.inlineRuns.compactMap(\.destination)
+
+        #expect(destinations.map(\.scheme) == ["https", "mailto"])
+        #expect(AgentMarkdownLinkPolicy.allows(URL(string: "https://example.com")!))
+        #expect(!AgentMarkdownLinkPolicy.allows(URL(fileURLWithPath: "/tmp/secret")))
+        #expect(!AgentMarkdownLinkPolicy.allows(URL(string: "javascript:alert(1)")!))
     }
 
     @Test func images_are_deduplicated_and_scoped_to_https_or_project_relative_paths() {

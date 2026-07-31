@@ -267,15 +267,18 @@ public struct NativeTranscriptGeometryDrivers {
     private let preparationStage: Stage
     private let mutationStage: Stage
     private let completionStage: Stage
+    private let viewportAnchorResolver: @MainActor () -> TranscriptGeometryAnchor?
 
     public init(
         preparation: @escaping Stage,
         mutation: @escaping Stage,
-        completion: @escaping Stage
+        completion: @escaping Stage,
+        viewportAnchor: @escaping @MainActor () -> TranscriptGeometryAnchor? = { nil }
     ) {
         preparationStage = preparation
         mutationStage = mutation
         completionStage = completion
+        viewportAnchorResolver = viewportAnchor
     }
 
     public static var automatic: NativeTranscriptGeometryDrivers {
@@ -301,6 +304,10 @@ public struct NativeTranscriptGeometryDrivers {
 
     fileprivate func complete(_ action: @escaping @MainActor () -> Void) {
         completionStage(action)
+    }
+
+    fileprivate func viewportAnchor() -> TranscriptGeometryAnchor? {
+        viewportAnchorResolver()
     }
 }
 
@@ -814,6 +821,35 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             _ value: NativeTranscriptRenderHeightValue,
             provenance: NativeTranscriptRenderHeightProvenance
         ) -> Bool {
+            let previouslyAccepted = acceptedRenderHeights[provenance.itemID].flatMap { accepted in
+                accepted.provenance.itemID == provenance.itemID
+                    && accepted.provenance.contentRevision == provenance.contentRevision
+                    && accepted.provenance.sessionID == provenance.sessionID
+                    ? accepted
+                    : nil
+            }
+            let previousValue = previouslyAccepted?.value
+            let changedOuterWidth = previouslyAccepted.map {
+                $0.provenance.outerEffectiveWidth != provenance.outerEffectiveWidth
+            } ?? false
+            let isAcceptable: Bool
+            if changedOuterWidth, let previousValue {
+                let isNewerPublication = value.key.contentVersion > previousValue.key.contentVersion
+                    || (value.key.contentVersion == previousValue.key.contentVersion
+                        && value.key.renderPublicationVersion
+                            > previousValue.key.renderPublicationVersion)
+                let isSamePublication = value.key.contentVersion == previousValue.key.contentVersion
+                    && value.key.renderPublicationVersion
+                        == previousValue.key.renderPublicationVersion
+                isAcceptable = isNewerPublication || isSamePublication
+            } else {
+                isAcceptable = value.isAcceptable(
+                    capturedContentRevision: provenance.contentRevision,
+                    currentContentRevision: provenance.contentRevision,
+                    previous: previousValue,
+                    effectiveWidth: value.key.effectiveWidth
+                )
+            }
             guard let item = desiredItems.first(where: { $0.id == provenance.itemID }),
                   item.heightAuthority == .versionedRender,
                   provenance == NativeTranscriptRenderHeightProvenance(
@@ -822,16 +858,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     outerEffectiveWidth: availableWidth,
                     sessionID: desiredSessionID
                   ),
-                  value.isAcceptable(
-                    capturedContentRevision: provenance.contentRevision,
-                    currentContentRevision: item.contentRevision,
-                    previous: acceptedRenderHeights[item.id].flatMap { accepted in
-                        accepted.provenance == provenance
-                            ? accepted.value
-                            : nil
-                    },
-                    effectiveWidth: value.key.effectiveWidth
-                  )
+                  isAcceptable
             else { return false }
             acceptedRenderHeights[item.id] = AcceptedRenderHeight(
                 provenance: provenance,
@@ -989,6 +1016,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         }
 
         private func viewportAnchor() -> TranscriptGeometryAnchor? {
+            if let resolved = geometryDrivers.viewportAnchor() { return resolved }
             guard let collectionView, let scrollView else { return nil }
             let visible = collectionView.indexPathsForVisibleItems()
                 .sorted { $0.item < $1.item }

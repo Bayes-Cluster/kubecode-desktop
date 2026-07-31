@@ -10,6 +10,15 @@ final class AgentMarkdownRenderStore {
         _ resourceContext: MarkdownProjectResourceContext?
     ) async -> Data?
 
+    private struct SemanticRequest: Equatable {
+        let source: String
+        let typography: WorkspaceTypography
+        let tone: AgentMarkdownTone
+        let styleRevision: Int
+        let resourceIdentity: String?
+        let resourceGeneration: Int
+    }
+
     private final class Row {
         var session: AgentMarkdownRenderSession!
         var commit: AgentMarkdownRenderCommit?
@@ -27,6 +36,8 @@ final class AgentMarkdownRenderStore {
         var latestTone: AgentMarkdownTone?
         var attachmentTask: Task<Void, Never>?
         var settlingPublicationVersion: Int?
+        var semanticRequest: SemanticRequest?
+        var attachmentRequestEpoch = 0
     }
 
     @ObservationIgnored private let documentBuilder: StreamingMarkdownSession.Builder
@@ -76,6 +87,12 @@ final class AgentMarkdownRenderStore {
         let row = row(for: rowID)
         activateStyle(row, identity: styleIdentity)
         activateResourceContext(row, context: resourceContext)
+        activateSemanticRequest(
+            row,
+            source: source,
+            typography: typography,
+            tone: tone
+        )
         row.latestSource = source
         row.latestTypography = typography
         row.latestTone = tone
@@ -125,14 +142,16 @@ final class AgentMarkdownRenderStore {
     func settleAttachments(
         rowID: String,
         expectedRenderPublicationVersion: Int,
-        images: [String: NSImage]
+        images: [String: NSImage],
+        expectedAttachmentRequestEpoch: Int
     ) -> Bool {
         guard !images.isEmpty,
               let row = rows[rowID],
               let base = row.commit,
               let inputs = row.inputs,
               inputs.renderPublicationVersion == expectedRenderPublicationVersion,
-              row.attachmentResolutionGeneration == inputs.attachmentResolutionGeneration
+              row.attachmentResolutionGeneration == inputs.attachmentResolutionGeneration,
+              expectedAttachmentRequestEpoch == row.attachmentRequestEpoch
         else { return false }
 
         row.attachmentResolutionGeneration += 1
@@ -164,14 +183,37 @@ final class AgentMarkdownRenderStore {
         return true
     }
 
-    func invalidateResourceContext(identity: String) {
+    @discardableResult
+    func invalidateResourceContext(identity: String, projectPath: String? = nil) -> Int {
+        let normalizedPath = projectPath.flatMap(
+            MarkdownResourcePolicy.projectRelativeImagePath
+        )
+        guard projectPath == nil || normalizedPath != nil else { return 0 }
+        let affectedRows = rows.values.filter { row in
+            guard row.resourceIdentity == identity else { return false }
+            let projectLoads = row.commit?.document.imageLoads.filter {
+                $0.projectPath != nil
+            } ?? []
+            return projectLoads.contains { load in
+                guard let normalizedPath else { return true }
+                return load.projectPath == normalizedPath
+            }
+        }
+        guard !affectedRows.isEmpty else { return 0 }
         resourceGenerations[identity, default: 0] &+= 1
-        for row in rows.values where row.resourceIdentity == identity {
-            row.resourceGeneration = resourceGenerations[identity]!
+        let generation = resourceGenerations[identity]!
+        for row in affectedRows {
+            row.resourceGeneration = generation
             if let source = row.latestSource,
                let typography = row.latestTypography,
                let tone = row.latestTone
             {
+                activateSemanticRequest(
+                    row,
+                    source: source,
+                    typography: typography,
+                    tone: tone
+                )
                 _ = row.session.submit(
                     source: source,
                     typography: typography,
@@ -182,6 +224,7 @@ final class AgentMarkdownRenderStore {
                 )
             }
         }
+        return affectedRows.count
     }
 
     func removeAll() {
@@ -197,6 +240,10 @@ final class AgentMarkdownRenderStore {
     func assertMainActorIsolation() {
         MainActor.assertIsolated()
     }
+
+#if DEBUG
+    var testingRowIDs: Set<String> { Set(rows.keys) }
+#endif
 
     private func row(for rowID: String) -> Row {
         if let row = rows[rowID] { return row }
@@ -239,7 +286,17 @@ final class AgentMarkdownRenderStore {
     }
 
     private func accept(_ commit: AgentMarkdownRenderCommit, rowID: String) {
-        guard let row = rows[rowID], row.session.latestCommit === commit else { return }
+        guard let row = rows[rowID],
+              row.session.latestCommit === commit,
+              row.semanticRequest == SemanticRequest(
+                source: commit.source,
+                typography: commit.typography,
+                tone: commit.tone,
+                styleRevision: commit.styleRevision,
+                resourceIdentity: commit.resourceIdentity,
+                resourceGeneration: commit.resourceGeneration
+              )
+        else { return }
         let acceptedCommit = row.commit.map {
             commit.carryingStablePrefix(from: $0)
         } ?? commit
@@ -274,6 +331,7 @@ final class AgentMarkdownRenderStore {
         let expectedPublication = row.renderPublicationVersion
         let expectedResourceIdentity = row.resourceIdentity
         let expectedResourceGeneration = row.resourceGeneration
+        let expectedAttachmentRequestEpoch = row.attachmentRequestEpoch
         let resourceContext = row.resourceContext
         row.settlingPublicationVersion = expectedPublication
         row.attachmentTask = Task { @MainActor [weak self] in
@@ -296,7 +354,8 @@ final class AgentMarkdownRenderStore {
                   current.commit === commit,
                   current.renderPublicationVersion == expectedPublication,
                   current.resourceIdentity == expectedResourceIdentity,
-                  current.resourceGeneration == expectedResourceGeneration
+                  current.resourceGeneration == expectedResourceGeneration,
+                  current.attachmentRequestEpoch == expectedAttachmentRequestEpoch
             else { return }
             var images: [String: NSImage] = [:]
             for (source, data) in loaded {
@@ -307,11 +366,34 @@ final class AgentMarkdownRenderStore {
             if !self.settleAttachments(
                 rowID: rowID,
                 expectedRenderPublicationVersion: expectedPublication,
-                images: images
+                images: images,
+                expectedAttachmentRequestEpoch: expectedAttachmentRequestEpoch
             ) {
                 current.settlingPublicationVersion = nil
             }
             current.attachmentTask = nil
         }
+    }
+
+    private func activateSemanticRequest(
+        _ row: Row,
+        source: String,
+        typography: WorkspaceTypography,
+        tone: AgentMarkdownTone
+    ) {
+        let request = SemanticRequest(
+            source: source,
+            typography: typography,
+            tone: tone,
+            styleRevision: row.styleRevision,
+            resourceIdentity: row.resourceIdentity,
+            resourceGeneration: row.resourceGeneration
+        )
+        guard row.semanticRequest != request else { return }
+        row.semanticRequest = request
+        row.attachmentRequestEpoch &+= 1
+        row.attachmentTask?.cancel()
+        row.attachmentTask = nil
+        row.settlingPublicationVersion = nil
     }
 }

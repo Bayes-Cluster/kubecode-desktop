@@ -175,6 +175,9 @@ struct StreamingTranscriptMarkdownTests {
         ))
         try await waitForPreparedMarkdown(firstView, containing: "Same complete source")
         let firstStorage = try #require(firstView.textStorage)
+        let stableSelection = NSRange(location: 0, length: 4)
+        firstView.setSelectedRange(stableSelection)
+        #expect(window.makeFirstResponder(firstView))
 
         controller.rootView = TranscriptRunOutputRow(output: final)
         layout(window: window, controller: controller)
@@ -185,6 +188,8 @@ struct StreamingTranscriptMarkdownTests {
         ))
         #expect(finalView === firstView)
         #expect(finalView.textStorage === firstStorage)
+        #expect(finalView.selectedRange() == stableSelection)
+        #expect(window.firstResponder === finalView)
 
         let session = AgentMarkdownRenderSession()
         let typography = WorkspaceTypography(fontName: "System", pointSize: 14)
@@ -208,6 +213,61 @@ struct StreamingTranscriptMarkdownTests {
         #expect(session.latestCommit === commit)
         #expect(session.latestContentVersion == 1)
         #expect(session.preparationCount == preparationCount)
+    }
+
+    @Test @MainActor func active_append_and_final_preserve_focus_selection_and_math_copy() async throws {
+        let initialSource = "Stable prefix with $x + y$.\n\nMutable tail"
+        let appendedSource = initialSource + " appended"
+        let controller = NSHostingController(rootView: TranscriptRunOutputRow(output: output(
+            source: initialSource,
+            phase: .update
+        )))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 300),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentViewController = controller
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        layout(window: window, controller: controller)
+        let textView = try #require(firstSubview(
+            of: NativeAgentMarkdownTextView.self,
+            in: controller.view
+        ))
+        try await waitForPreparedMarkdown(textView, containing: "Mutable tail")
+        let textStorage = try #require(textView.textStorage)
+        let selection = try #require(textView.string.range(of: "Stable prefix"))
+        let selectionRange = NSRange(selection, in: textView.string)
+        textView.setSelectedRange(selectionRange)
+        #expect(window.makeFirstResponder(textView))
+
+        textView.setSelectedRange(NSRange(location: 0, length: textView.string.utf16.count))
+        NSPasteboard.general.clearContents()
+        textView.copy(nil)
+        #expect(NSPasteboard.general.string(forType: .string)?.contains(#"\(x + y\)"#) == true)
+        textView.setSelectedRange(selectionRange)
+
+        controller.rootView = TranscriptRunOutputRow(output: output(
+            source: appendedSource,
+            phase: .update
+        ))
+        layout(window: window, controller: controller)
+        try await waitForPreparedMarkdown(textView, containing: "Mutable tail appended")
+        #expect(textView.textStorage === textStorage)
+        #expect(textView.selectedRange() == selectionRange)
+        #expect(window.firstResponder === textView)
+
+        controller.rootView = TranscriptRunOutputRow(output: output(
+            source: appendedSource,
+            phase: .final
+        ))
+        layout(window: window, controller: controller)
+        await Task.yield()
+        #expect(textView.textStorage === textStorage)
+        #expect(textView.selectedRange() == selectionRange)
+        #expect(window.firstResponder === textView)
     }
 
     private func output(
