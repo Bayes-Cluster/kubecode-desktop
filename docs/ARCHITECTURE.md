@@ -94,9 +94,9 @@ visible source. Phase and provider source metadata do not change visible or copy
 content, so an identical-source update-to-final handoff produces no collection
 reload and retains the native view, text storage, render session, content
 version, and prepared commit. Every non-output entry retains its existing
-complete-entry revision. A changed source still changes output revision and may
-recreate the collection host; persistent host reconfiguration across different
-streaming snapshots remains the explicit scope of Issue #7.
+complete-entry revision. A changed source reconfigures the surviving collection
+item's existing hosting view, retaining its native text storage and row-owned
+render session.
 
 Each native message coordinator applies prepared render commits keyed by source,
 typography, tone, and Project resource identity. `sizeThatFits` consumes only a
@@ -110,21 +110,38 @@ and attachment generation. Independent render-request tokens reject stale
 same-snapshot style/resource jobs, and stable attributed prefixes cross only
 exactly compatible appearance/resource inputs. The collection accepts a newer
 publication, or the same publication at a newly current width, but never an
-older tuple; it invalidates only that row's cache without replacing its host.
-Collection transaction serialization and viewport policy remain a separate
-geometry layer.
+older tuple. It remeasures only that row in the pending target without replacing
+its host. The scalar publication enters the collection's serialized geometry
+layer; it never invalidates visible layout independently.
 Credential-free HTTPS images use the bounded ephemeral image loader; validated
 relative image paths use `RuntimeClient.readAsset` with the current Project ID.
 The row store coalesces attachment work and publishes at most one newer render
-and height generation for a matching changed settlement. This layer does not
-claim follow-tail stability, anchor stability, or atomic collection geometry.
+and height generation for a matching changed settlement. That scalar settlement
+uses the same item/height/inset/width collection transaction as source growth.
 Read-only Agent output disables spelling correction, text replacement, and
 smart punctuation.
-Stable insertions, deletions, and row reloads use one nonanimated collection
-batch. Transactions that combine structural and content changes, plus true
-reordering, use a full reload to avoid mixing old and new index paths. Collection completion
-is the only point for anchor restoration or tail following, and streaming never
-forces document-wide synchronous layout.
+One MainActor geometry driver retains one in-flight transaction and one
+replaceable latest full intent. It premeasures every target row, then commits the
+item projection, persistent row-builder configuration, scalar sizes, rounded
+width, and complete composer inset together. Every mounted Markdown row uses
+versioned height authority, including user messages and expanded thinking;
+collapsed thinking remains synchronously measurable. The Issue #6 inner render
+width stays in its publication identity, while separate outer-row width and
+session provenance reject stale callbacks without deadlocking capped Markdown
+or user bubbles. Stable insertions and deletions use one nonanimated collection
+batch. Duplicate-ID targets are rejected without consuming a generation or
+replacing pending valid work. Transactions that combine structural and content
+changes, plus true reordering, use a generation-guarded full reload to avoid
+mixing old and new index paths. Width changes stage a frame valid for both old
+and target item widths, materialize the target FlowLayout attributes, and only
+then settle the final frame; AppKit never validates cached wider attributes
+against a shrink target. Layout reads only committed sizes. A matching
+collection completion is the only point for anchor restoration
+or tail following; stale generations and stale user-intent revisions have no
+viewport effect. Followers move to the exact obstruction-aware maximum origin,
+while scrolled-away users preserve the first visible stable ID and offset with a
+deterministic survivor fallback if it is deleted. Streaming never forces
+document-wide synchronous layout.
 Rendering acceptance interleaves sidebar resize, live scroll, and streaming
 growth rather than testing those operations sequentially.
 
