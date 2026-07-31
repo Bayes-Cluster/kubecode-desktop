@@ -107,6 +107,72 @@ public struct TranscriptGeometryItem: Hashable, Sendable {
     }
 }
 
+public struct TranscriptDisclosureGeometryPresentation: Hashable, Sendable {
+    public let id: String
+    public let ownerItemID: String
+    public let revision: Int
+    public let isExpanded: Bool
+
+    public init(
+        id: String,
+        ownerItemID: String,
+        revision: Int,
+        isExpanded: Bool
+    ) {
+        self.id = id
+        self.ownerItemID = ownerItemID
+        self.revision = revision
+        self.isExpanded = isExpanded
+    }
+}
+
+public struct TranscriptDisclosureGeometryState: Hashable, Sendable {
+    public private(set) var presentations: [TranscriptDisclosureGeometryPresentation]
+
+    public static let empty = TranscriptDisclosureGeometryState(presentations: [])
+
+    public init(presentations: [TranscriptDisclosureGeometryPresentation]) {
+        self.presentations = presentations
+    }
+
+    public var hasUniquePresentationIDs: Bool {
+        Set(presentations.map(\.id)).count == presentations.count
+    }
+
+    public func presentation(for id: String) -> TranscriptDisclosureGeometryPresentation? {
+        presentations.first { $0.id == id }
+    }
+
+    @discardableResult
+    public mutating func replace(
+        _ presentation: TranscriptDisclosureGeometryPresentation
+    ) -> Bool {
+        guard let index = presentations.firstIndex(where: { $0.id == presentation.id }) else {
+            presentations.append(presentation)
+            return true
+        }
+        guard presentations[index] != presentation else { return false }
+        presentations[index] = presentation
+        return true
+    }
+
+    public func changedOwnerItemIDs(
+        comparedWith previous: TranscriptDisclosureGeometryState
+    ) -> Set<String> {
+        let previousByID = Dictionary(uniqueKeysWithValues: previous.presentations.map {
+            ($0.id, $0)
+        })
+        let currentByID = Dictionary(uniqueKeysWithValues: presentations.map { ($0.id, $0) })
+        let ids = Set(previousByID.keys).union(currentByID.keys)
+        return Set(ids.flatMap { id -> [String] in
+            let old = previousByID[id]
+            let new = currentByID[id]
+            guard old != new else { return [] }
+            return [old?.ownerItemID, new?.ownerItemID].compactMap { $0 }
+        })
+    }
+}
+
 public struct TranscriptGeometryItemSize: Hashable, Sendable {
     public let itemID: String
     public let contentRevision: Int
@@ -184,10 +250,13 @@ public struct TranscriptGeometryAnchor: Hashable, Sendable {
 public enum TranscriptGeometryViewportMode: Hashable, Sendable {
     case followTail
     case preserve(TranscriptGeometryAnchor)
+    case preserveDisclosure(TranscriptGeometryAnchor)
 
     public var anchor: TranscriptGeometryAnchor? {
-        guard case let .preserve(anchor) = self else { return nil }
-        return anchor
+        switch self {
+        case .followTail: nil
+        case let .preserve(anchor), let .preserveDisclosure(anchor): anchor
+        }
     }
 }
 
@@ -210,6 +279,8 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
     public let effectiveWidth: CGFloat
     public let viewportIntent: TranscriptGeometryViewportIntent
     public let forcesReload: Bool
+    public let sessionID: String?
+    public let disclosures: TranscriptDisclosureGeometryState
 
     public init(
         items: [TranscriptGeometryItem],
@@ -217,7 +288,9 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
         bottomInset: CGFloat,
         effectiveWidth: CGFloat,
         viewportIntent: TranscriptGeometryViewportIntent,
-        forcesReload: Bool = false
+        forcesReload: Bool = false,
+        sessionID: String? = nil,
+        disclosures: TranscriptDisclosureGeometryState = .empty
     ) {
         self.items = items
         self.sizes = sizes
@@ -225,14 +298,25 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
         self.effectiveWidth = max(effectiveWidth, 1).rounded(.toNearestOrAwayFromZero)
         self.viewportIntent = viewportIntent
         self.forcesReload = forcesReload
+        self.sessionID = sessionID
+        self.disclosures = disclosures
     }
 
     public var hasUniqueItemIDs: Bool {
         Set(items.map(\.id)).count == items.count
     }
 
+    public var hasValidDisclosureProvenance: Bool {
+        guard hasUniqueItemIDs else { return false }
+        let itemsByID = Dictionary(uniqueKeysWithValues: items.map { ($0.id, $0) })
+        return disclosures.hasUniquePresentationIDs
+            && disclosures.presentations.allSatisfy { presentation in
+                itemsByID[presentation.ownerItemID]?.layoutRevision == presentation.revision
+            }
+    }
+
     public var isReady: Bool {
-        hasUniqueItemIDs && items.allSatisfy { item in
+        hasUniqueItemIDs && hasValidDisclosureProvenance && items.allSatisfy { item in
             sizes[item.id]?.matches(item, effectiveWidth: effectiveWidth) == true
         }
     }
@@ -244,7 +328,9 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
             bottomInset: bottomInset,
             effectiveWidth: effectiveWidth,
             viewportIntent: viewportIntent,
-            forcesReload: false
+            forcesReload: false,
+            sessionID: sessionID,
+            disclosures: disclosures
         )
     }
 
@@ -316,6 +402,60 @@ public struct TranscriptGeometryMutationPlan: Hashable, Sendable {
             deletedIDs: deleted
         )
     }
+
+    public static func between(
+        previous: TranscriptGeometryTarget,
+        current: TranscriptGeometryTarget
+    ) -> TranscriptGeometryMutationPlan {
+        let itemPlan = between(previous: previous.items, current: current.items)
+        guard !itemPlan.reloadsAllItems else { return itemPlan }
+        let currentIDs = Set(current.items.map(\.id))
+        let disclosureOwners = current.disclosures.changedOwnerItemIDs(
+            comparedWith: previous.disclosures
+        ).intersection(currentIDs)
+        let changedIDs = itemPlan.changedIDs.union(disclosureOwners)
+        if (!itemPlan.insertedIDs.isEmpty || !itemPlan.deletedIDs.isEmpty), !changedIDs.isEmpty {
+            return .reloadAll
+        }
+        return TranscriptGeometryMutationPlan(
+            reloadsAllItems: false,
+            changedIDs: changedIDs,
+            insertedIDs: itemPlan.insertedIDs,
+            deletedIDs: itemPlan.deletedIDs
+        )
+    }
+}
+
+public struct TranscriptGeometryCompletionProvenance: Hashable, Sendable {
+    public let sessionID: String?
+    public let items: [TranscriptGeometryItem]
+    public let sizes: [String: TranscriptGeometryItemSize]
+    public let effectiveWidth: CGFloat
+    public let disclosures: TranscriptDisclosureGeometryState
+
+    public init(
+        sessionID: String?,
+        items: [TranscriptGeometryItem],
+        sizes: [String: TranscriptGeometryItemSize],
+        effectiveWidth: CGFloat,
+        disclosures: TranscriptDisclosureGeometryState
+    ) {
+        self.sessionID = sessionID
+        self.items = items
+        self.sizes = sizes
+        self.effectiveWidth = max(effectiveWidth, 1).rounded(.toNearestOrAwayFromZero)
+        self.disclosures = disclosures
+    }
+
+    public init(target: TranscriptGeometryTarget) {
+        self.init(
+            sessionID: target.sessionID,
+            items: target.items,
+            sizes: target.sizes,
+            effectiveWidth: target.effectiveWidth,
+            disclosures: target.disclosures
+        )
+    }
 }
 
 public struct TranscriptGeometryTransaction: Hashable, Sendable {
@@ -324,6 +464,7 @@ public struct TranscriptGeometryTransaction: Hashable, Sendable {
     public let previousTarget: TranscriptGeometryTarget
     public let target: TranscriptGeometryTarget
     public let mutationPlan: TranscriptGeometryMutationPlan
+    public let completionProvenance: TranscriptGeometryCompletionProvenance
 
     public var previousItems: [TranscriptGeometryItem] { previousTarget.items }
 }
@@ -331,6 +472,7 @@ public struct TranscriptGeometryTransaction: Hashable, Sendable {
 public enum TranscriptGeometryViewportEffect: Hashable, Sendable {
     case followTail
     case preserve(TranscriptGeometryAnchor)
+    case preserveDisclosure(TranscriptGeometryAnchor)
 }
 
 public struct TranscriptGeometryCompletion: Hashable, Sendable {
@@ -357,7 +499,7 @@ public struct TranscriptGeometryTransactionState: Sendable {
 
     @discardableResult
     public mutating func submit(_ target: TranscriptGeometryTarget) -> Int? {
-        guard target.hasUniqueItemIDs else { return nil }
+        guard target.hasUniqueItemIDs, target.hasValidDisclosureProvenance else { return nil }
         if target == committed {
             pending = nil
             pendingIntentGeneration = nil
@@ -388,15 +530,16 @@ public struct TranscriptGeometryTransactionState: Sendable {
         let plan = target.forcesReload
             ? TranscriptGeometryMutationPlan.reloadAll
             : TranscriptGeometryMutationPlan.between(
-                previous: committed.items,
-                current: target.items
+                previous: committed,
+                current: target
             )
         let transaction = TranscriptGeometryTransaction(
             generation: nextTransactionGeneration,
             intentGeneration: intentGeneration,
             previousTarget: committed,
             target: target,
-            mutationPlan: plan
+            mutationPlan: plan,
+            completionProvenance: TranscriptGeometryCompletionProvenance(target: target)
         )
         nextTransactionGeneration += 1
         committed = target.committedValue
@@ -408,10 +551,12 @@ public struct TranscriptGeometryTransactionState: Sendable {
 
     public mutating func complete(
         transactionGeneration: Int,
+        completionProvenance: TranscriptGeometryCompletionProvenance,
         currentUserIntentRevision: Int
     ) -> TranscriptGeometryCompletion {
         guard let transaction = inFlight,
-              transaction.generation == transactionGeneration
+              transaction.generation == transactionGeneration,
+              completionProvenance == transaction.completionProvenance
         else { return .stale }
         inFlight = nil
         guard pending == nil,
@@ -423,7 +568,7 @@ public struct TranscriptGeometryTransactionState: Sendable {
         switch transaction.target.viewportIntent.mode {
         case .followTail:
             effect = .followTail
-        case let .preserve(anchor):
+        case let .preserve(anchor), let .preserveDisclosure(anchor):
             let resolvedID = TranscriptGeometryAnchor.resolvedItemID(
                 requested: anchor.itemID,
                 previous: transaction.previousItems,
@@ -432,7 +577,12 @@ public struct TranscriptGeometryTransactionState: Sendable {
             guard let resolvedID else {
                 return TranscriptGeometryCompletion(accepted: true, viewportEffect: nil)
             }
-            effect = .preserve(.init(itemID: resolvedID, offset: anchor.offset))
+            let resolved = TranscriptGeometryAnchor(itemID: resolvedID, offset: anchor.offset)
+            if case .preserveDisclosure = transaction.target.viewportIntent.mode {
+                effect = .preserveDisclosure(resolved)
+            } else {
+                effect = .preserve(resolved)
+            }
         }
         return TranscriptGeometryCompletion(accepted: true, viewportEffect: effect)
     }

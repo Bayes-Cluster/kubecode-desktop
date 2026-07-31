@@ -113,10 +113,31 @@ private struct NativeTranscriptRowRenderContextKey: EnvironmentKey {
     static let defaultValue: NativeTranscriptRowRenderContext? = nil
 }
 
+public struct NativeTranscriptDisclosureContext: Sendable {
+    public let state: TranscriptDisclosureGeometryState
+
+    public init(state: TranscriptDisclosureGeometryState) {
+        self.state = state
+    }
+
+    public func isExpanded(id: String, fallback: Bool) -> Bool {
+        state.presentation(for: id)?.isExpanded ?? fallback
+    }
+}
+
+private struct NativeTranscriptDisclosureContextKey: EnvironmentKey {
+    static let defaultValue: NativeTranscriptDisclosureContext? = nil
+}
+
 public extension EnvironmentValues {
     var nativeTranscriptRowRenderContext: NativeTranscriptRowRenderContext? {
         get { self[NativeTranscriptRowRenderContextKey.self] }
         set { self[NativeTranscriptRowRenderContextKey.self] = newValue }
+    }
+
+    var nativeTranscriptDisclosureContext: NativeTranscriptDisclosureContext? {
+        get { self[NativeTranscriptDisclosureContextKey.self] }
+        set { self[NativeTranscriptDisclosureContextKey.self] = newValue }
     }
 }
 
@@ -317,6 +338,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
     public let sessionID: String?
     public let outputRevision: String
     public let bottomInset: CGFloat
+    public let disclosures: TranscriptDisclosureGeometryState
     public let scrollController: TranscriptScrollController
     private let geometryDrivers: NativeTranscriptGeometryDrivers
     private let rowBuilder: (Int) -> AnyView
@@ -326,6 +348,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         sessionID: String?,
         outputRevision: String,
         bottomInset: CGFloat,
+        disclosures: TranscriptDisclosureGeometryState = .empty,
         scrollController: TranscriptScrollController,
         geometryDrivers: NativeTranscriptGeometryDrivers = .automatic,
         rowBuilder: @escaping (Int) -> AnyView
@@ -334,6 +357,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         self.sessionID = sessionID
         self.outputRevision = outputRevision
         self.bottomInset = bottomInset
+        self.disclosures = disclosures
         self.scrollController = scrollController
         self.geometryDrivers = geometryDrivers
         self.rowBuilder = rowBuilder
@@ -401,6 +425,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         private var desiredItems: [NativeTranscriptItem]
         private var desiredRowBuilder: (Int) -> AnyView
         private var desiredBottomInset: CGFloat
+        private var desiredDisclosures: TranscriptDisclosureGeometryState
         private var desiredSessionID: String?
         private var outputRevision: String
         private var scrollRequestSequence: Int
@@ -428,11 +453,19 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         public var pendingGeometryEffectiveWidth: CGFloat? {
             geometryState.pending?.effectiveWidth
         }
+        public private(set) var lastReconfiguredItemIDs: Set<String> = []
+
+        public func committedDisclosurePresentation(
+            id: String
+        ) -> TranscriptDisclosureGeometryPresentation? {
+            appliedGeometryTarget.disclosures.presentation(for: id)
+        }
 
         init(parent: NativeTranscriptCollectionView) {
             desiredItems = parent.items
             desiredRowBuilder = parent.rowBuilder
             desiredBottomInset = parent.bottomInset
+            desiredDisclosures = parent.disclosures
             desiredSessionID = parent.sessionID
             outputRevision = parent.outputRevision
             scrollRequestSequence = parent.scrollController.scrollRequestSequence
@@ -443,7 +476,8 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 sizes: [:],
                 bottomInset: 0,
                 effectiveWidth: 1,
-                viewportIntent: .init(revision: 1, mode: .followTail)
+                viewportIntent: .init(revision: 1, mode: .followTail),
+                sessionID: parent.sessionID
             )
             geometryState = TranscriptGeometryTransactionState(committed: initialGeometry)
             appliedGeometryTarget = initialGeometry
@@ -492,6 +526,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             let changedSession = desiredSessionID != parent.sessionID
             let changedItems = desiredItems != parent.items
             let changedInset = abs(desiredBottomInset - parent.bottomInset) >= 0.5
+            let changedDisclosures = desiredDisclosures != parent.disclosures
             let changedOutput = outputRevision != parent.outputRevision
             let changedScrollRequest = scrollRequestSequence
                 != parent.scrollController.scrollRequestSequence
@@ -499,6 +534,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             desiredItems = parent.items
             desiredRowBuilder = parent.rowBuilder
             desiredBottomInset = parent.bottomInset
+            desiredDisclosures = parent.disclosures
             desiredSessionID = parent.sessionID
             outputRevision = parent.outputRevision
             scrollRequestSequence = parent.scrollController.scrollRequestSequence
@@ -517,7 +553,8 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 _ = scrollController.outputDidChange()
             }
 
-            guard initial || changedSession || changedItems || changedInset || changedScrollRequest
+            guard initial || changedSession || changedItems || changedInset
+                || changedDisclosures || changedScrollRequest
             else { return }
             if availableWidth <= 1, !desiredItems.isEmpty {
                 geometryDrivers.prepare { [weak self] in
@@ -548,7 +585,8 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 items: committedItems,
                 rowBuilder: committedRowBuilder,
                 width: committedEffectiveWidth,
-                sessionID: committedSessionID
+                sessionID: committedSessionID,
+                disclosures: appliedGeometryTarget.disclosures
             ))
             return hostingItem
         }
@@ -613,7 +651,24 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             guard width > 1 || desiredItems.isEmpty else { return }
             let geometryItems = desiredItems.map(\.geometryItem)
             let viewportMode: TranscriptGeometryViewportMode
-            if scrollController.followsOutput {
+            let carriedDisclosureAnchor: TranscriptGeometryAnchor? = geometryState.inFlight
+                .flatMap { transaction -> TranscriptGeometryAnchor? in
+                    let mode = transaction.target.viewportIntent.mode
+                    guard transaction.target.sessionID == desiredSessionID,
+                          case let .preserveDisclosure(anchor) = mode
+                    else { return nil }
+                    return anchor
+                }
+            let changedDisclosureOwnerID = desiredDisclosures.presentations.first { presentation in
+                geometryState.committed.disclosures.presentation(for: presentation.id) != presentation
+            }?.ownerItemID
+            if let carriedDisclosureAnchor {
+                viewportMode = .preserveDisclosure(carriedDisclosureAnchor)
+            } else if let changedDisclosureOwnerID,
+               let anchor = viewportAnchor(itemID: changedDisclosureOwnerID)
+            {
+                viewportMode = .preserveDisclosure(anchor)
+            } else if scrollController.followsOutput {
                 viewportMode = .followTail
             } else if let anchor = viewportAnchor() {
                 viewportMode = .preserve(anchor)
@@ -632,7 +687,9 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 bottomInset: desiredBottomInset,
                 effectiveWidth: width,
                 viewportIntent: .init(revision: userIntentRevision, mode: viewportMode),
-                forcesReload: forcesReload
+                forcesReload: forcesReload,
+                sessionID: desiredSessionID,
+                disclosures: desiredDisclosures
             )
             guard let intentGeneration = geometryState.submit(target) else { return }
             pendingPayload = Payload(
@@ -719,7 +776,8 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     items: payload.items,
                     rowBuilder: payload.rowBuilder,
                     width: pending.effectiveWidth,
-                    sessionID: payload.sessionID
+                    sessionID: payload.sessionID,
+                    disclosures: pending.disclosures
                 )
                 host.frame = NSRect(
                     x: -100_000,
@@ -785,7 +843,8 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             items: [NativeTranscriptItem],
             rowBuilder: (Int) -> AnyView,
             width: CGFloat,
-            sessionID: String?
+            sessionID: String?,
+            disclosures: TranscriptDisclosureGeometryState
         ) -> AnyView {
             let context: NativeTranscriptRowRenderContext?
             if items.indices.contains(index) {
@@ -813,6 +872,10 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     .frame(width: width, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
                     .environment(\.nativeTranscriptRowRenderContext, context)
+                    .environment(
+                        \.nativeTranscriptDisclosureContext,
+                        NativeTranscriptDisclosureContext(state: disclosures)
+                    )
             )
         }
 
@@ -889,7 +952,22 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                   let collectionView,
                   let scrollView
             else { return }
+            if transaction.target.sessionID != desiredSessionID {
+                _ = geometryState.complete(
+                    transactionGeneration: transaction.generation,
+                    completionProvenance: transaction.completionProvenance,
+                    currentUserIntentRevision: userIntentRevision
+                )
+                inFlightPayload = nil
+                if geometryState.pending?.isReady == true {
+                    launchReadyTransaction()
+                } else if geometryState.pending != nil {
+                    schedulePreparation()
+                }
+                return
+            }
             geometryMutationCount += 1
+            lastReconfiguredItemIDs = []
             committedItems = payload.items
             committedRowBuilder = payload.rowBuilder
             committedBottomInset = transaction.target.bottomInset
@@ -937,9 +1015,13 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             collectionView.collectionViewLayout?.invalidateLayout()
 
             if transaction.mutationPlan.reloadsAllItems {
+                lastReconfiguredItemIDs = Set(committedItems.map(\.id))
                 collectionView.reloadData()
                 collectionView.layoutSubtreeIfNeeded()
-                finishAppKitMutation(generation: transaction.generation)
+                finishAppKitMutation(
+                    generation: transaction.generation,
+                    completionProvenance: transaction.completionProvenance
+                )
                 return
             }
 
@@ -953,19 +1035,26 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             })
             guard !insertedPaths.isEmpty || !deletedPaths.isEmpty else {
                 collectionView.layoutSubtreeIfNeeded()
-                finishAppKitMutation(generation: transaction.generation)
+                finishAppKitMutation(
+                    generation: transaction.generation,
+                    completionProvenance: transaction.completionProvenance
+                )
                 return
             }
             collectionView.performBatchUpdates {
                 if !deletedPaths.isEmpty { collectionView.deleteItems(at: deletedPaths) }
                 if !insertedPaths.isEmpty { collectionView.insertItems(at: insertedPaths) }
             } completionHandler: { [weak self] _ in
-                self?.finishAppKitMutation(generation: transaction.generation)
+                self?.finishAppKitMutation(
+                    generation: transaction.generation,
+                    completionProvenance: transaction.completionProvenance
+                )
             }
         }
 
         private func reconfigureVisibleItems(changedIDs: Set<String>) {
             guard let collectionView, !changedIDs.isEmpty else { return }
+            lastReconfiguredItemIDs = changedIDs
             for item in collectionView.visibleItems() {
                 guard let hostingItem = item as? TranscriptHostingItem,
                       let indexPath = collectionView.indexPath(for: item),
@@ -977,21 +1066,32 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     items: committedItems,
                     rowBuilder: committedRowBuilder,
                     width: committedEffectiveWidth,
-                    sessionID: committedSessionID
+                    sessionID: committedSessionID,
+                    disclosures: appliedGeometryTarget.disclosures
                 ))
             }
         }
 
-        private func finishAppKitMutation(generation: Int) {
+        private func finishAppKitMutation(
+            generation: Int,
+            completionProvenance: TranscriptGeometryCompletionProvenance
+        ) {
             geometryDrivers.complete { [weak self] in
-                self?.completeMutation(generation: generation)
+                self?.completeMutation(
+                    generation: generation,
+                    completionProvenance: completionProvenance
+                )
             }
         }
 
-        private func completeMutation(generation: Int) {
+        private func completeMutation(
+            generation: Int,
+            completionProvenance: TranscriptGeometryCompletionProvenance
+        ) {
             guard geometryState.inFlight?.generation == generation else { return }
             let completion = geometryState.complete(
                 transactionGeneration: generation,
+                completionProvenance: completionProvenance,
                 currentUserIntentRevision: userIntentRevision
             )
             guard completion.accepted else { return }
@@ -1002,6 +1102,8 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 case .followTail where scrollController.followsOutput:
                     scrollToBottom()
                 case let .preserve(anchor) where !scrollController.followsOutput:
+                    restore(anchor: anchor)
+                case let .preserveDisclosure(anchor):
                     restore(anchor: anchor)
                 default:
                     break
@@ -1015,7 +1117,20 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             }
         }
 
-        private func viewportAnchor() -> TranscriptGeometryAnchor? {
+        private func viewportAnchor(itemID: String? = nil) -> TranscriptGeometryAnchor? {
+            if let itemID,
+               let collectionView,
+               let scrollView,
+               let index = committedItems.firstIndex(where: { $0.id == itemID }),
+               let attributes = collectionView.layoutAttributesForItem(
+                   at: IndexPath(item: index, section: 0)
+               )
+            {
+                return TranscriptGeometryAnchor(
+                    itemID: itemID,
+                    offset: attributes.frame.minY - scrollView.documentVisibleRect.minY
+                )
+            }
             if let resolved = geometryDrivers.viewportAnchor() { return resolved }
             guard let collectionView, let scrollView else { return nil }
             let visible = collectionView.indexPathsForVisibleItems()
