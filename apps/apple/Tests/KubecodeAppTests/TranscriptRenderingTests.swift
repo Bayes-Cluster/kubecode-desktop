@@ -1234,7 +1234,7 @@ struct TranscriptRenderingTests {
         ) == 72)
     }
 
-    @Test @MainActor func native_composer_remeasures_wrapped_text_after_appkit_layout() async {
+    @Test @MainActor func native_composer_measures_wrapped_text_after_appkit_layout() {
         var text = String(repeating: "A native composer line that must wrap. ", count: 20)
         var measuredHeight = ComposerHeightCalculator.minimumHeight
         let controller = NSHostingController(rootView: NativeComposerTextView(
@@ -1260,12 +1260,12 @@ struct TranscriptRenderingTests {
         defer { window.orderOut(nil) }
         window.layoutIfNeeded()
         controller.view.layoutSubtreeIfNeeded()
-        await Task.yield()
-        try? await Task.sleep(for: .milliseconds(100))
 
         let scrollView = firstSubview(of: ComposerScrollView.self, in: controller.view)
+        scrollView?.scheduleMeasurement()
+        _ = scrollView?.performPendingMeasurement()
         let textView = scrollView?.documentView as? NSTextView
-        let actualWidth = scrollView?.contentSize.width ?? 0
+        let actualWidth = scrollView?.bounds.width ?? 0
         let independentlyMeasuredHeight = textView.map {
             ComposerHeightCalculator.height(
                 for: $0.string,
@@ -1281,12 +1281,11 @@ struct TranscriptRenderingTests {
         #expect(measuredHeight == 40)
         measuredHeight = ComposerHeightCalculator.minimumHeight
         scrollView?.scheduleMeasurement()
-        await Task.yield()
-        try? await Task.sleep(for: .milliseconds(100))
-        #expect(measuredHeight == ComposerHeightCalculator.maximumHeight)
+        #expect(scrollView?.performPendingMeasurement() == false)
+        #expect(measuredHeight == ComposerHeightCalculator.minimumHeight)
     }
 
-    @Test @MainActor func native_composer_coalesces_repeated_layout_measurements() async throws {
+    @Test @MainActor func native_composer_coalesces_repeated_layout_measurements() {
         var measuredHeight = ComposerHeightCalculator.minimumHeight
         let scrollView = ComposerScrollView()
         let textView = ComposerTextView()
@@ -1303,8 +1302,7 @@ struct TranscriptRenderingTests {
         for _ in 0..<100 {
             scrollView.scheduleMeasurement()
         }
-        await Task.yield()
-        try await Task.sleep(for: .milliseconds(50))
+        #expect(scrollView.performPendingMeasurement())
 
         #expect(scrollView.completedMeasurementCount == 1)
         #expect(measuredHeight > ComposerHeightCalculator.minimumHeight)
@@ -1312,8 +1310,7 @@ struct TranscriptRenderingTests {
         measuredHeight = ComposerHeightCalculator.minimumHeight
         textView.string += " One more measured token."
         scrollView.scheduleMeasurement()
-        await Task.yield()
-        try await Task.sleep(for: .milliseconds(50))
+        #expect(scrollView.performPendingMeasurement())
 
         #expect(scrollView.completedMeasurementCount == 2)
         #expect(measuredHeight > ComposerHeightCalculator.minimumHeight)
