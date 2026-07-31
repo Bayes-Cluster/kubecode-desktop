@@ -4,7 +4,23 @@ import SwiftUI
 import KubecodeUI
 
 @MainActor
-public final class NativeTranscriptCollectionNSView: NSCollectionView {}
+public final class NativeTranscriptCollectionNSView: NSCollectionView {
+    fileprivate var minimumSafeFrameWidth: CGFloat = 1
+
+    public override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(NSSize(
+            width: max(newSize.width, minimumSafeFrameWidth),
+            height: newSize.height
+        ))
+    }
+
+    public override func setBoundsSize(_ newSize: NSSize) {
+        super.setBoundsSize(NSSize(
+            width: max(newSize.width, minimumSafeFrameWidth),
+            height: newSize.height
+        ))
+    }
+}
 
 public enum NativeTranscriptResizePolicy: Hashable, Sendable {
     case immediate
@@ -70,18 +86,21 @@ public struct NativeTranscriptRenderHeightProvenance: Hashable, Sendable {
     public let itemID: String
     public let contentRevision: Int
     public let outerEffectiveWidth: CGFloat
+    public let widthGeneration: Int
     public let sessionID: String?
 
     public init(
         itemID: String,
         contentRevision: Int,
         outerEffectiveWidth: CGFloat,
+        widthGeneration: Int = 0,
         sessionID: String?
     ) {
         self.itemID = itemID
         self.contentRevision = contentRevision
         self.outerEffectiveWidth = max(outerEffectiveWidth, 1)
             .rounded(.toNearestOrAwayFromZero)
+        self.widthGeneration = widthGeneration
         self.sessionID = sessionID
     }
 }
@@ -284,21 +303,29 @@ public struct TranscriptCollectionUpdatePlan: Equatable, Sendable {
 @MainActor
 public struct NativeTranscriptGeometryDrivers {
     public typealias Stage = @MainActor (@escaping @MainActor () -> Void) -> Void
+    public typealias WidthSettlementCancellation = @MainActor () -> Void
+    public typealias WidthSettlementStage = @MainActor (
+        TranscriptWidthSettlementTarget,
+        @escaping @MainActor () -> Void
+    ) -> WidthSettlementCancellation
 
     private let preparationStage: Stage
     private let mutationStage: Stage
     private let completionStage: Stage
+    private let widthSettlementStage: WidthSettlementStage
     private let viewportAnchorResolver: @MainActor () -> TranscriptGeometryAnchor?
 
     public init(
         preparation: @escaping Stage,
         mutation: @escaping Stage,
         completion: @escaping Stage,
+        widthSettlement: @escaping WidthSettlementStage,
         viewportAnchor: @escaping @MainActor () -> TranscriptGeometryAnchor? = { nil }
     ) {
         preparationStage = preparation
         mutationStage = mutation
         completionStage = completion
+        widthSettlementStage = widthSettlement
         viewportAnchorResolver = viewportAnchor
     }
 
@@ -311,7 +338,15 @@ public struct NativeTranscriptGeometryDrivers {
                 }
             },
             mutation: { action in action() },
-            completion: { action in action() }
+            completion: { action in action() },
+            widthSettlement: { _, action in
+                let task = Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(80))
+                    guard !Task.isCancelled else { return }
+                    action()
+                }
+                return { task.cancel() }
+            }
         )
     }
 
@@ -325,6 +360,13 @@ public struct NativeTranscriptGeometryDrivers {
 
     fileprivate func complete(_ action: @escaping @MainActor () -> Void) {
         completionStage(action)
+    }
+
+    fileprivate func settleWidth(
+        _ target: TranscriptWidthSettlementTarget,
+        action: @escaping @MainActor () -> Void
+    ) -> WidthSettlementCancellation {
+        widthSettlementStage(target, action)
     }
 
     fileprivate func viewportAnchor() -> TranscriptGeometryAnchor? {
@@ -438,10 +480,15 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         private var acceptedRenderHeights: [String: AcceptedRenderHeight] = [:]
         private var geometryState: TranscriptGeometryTransactionState
         private var appliedGeometryTarget: TranscriptGeometryTarget
+        private var widthSettlementState = TranscriptWidthSettlementState(
+            initialEffectiveWidth: 1
+        )
         private var pendingPayload: Payload?
         private var inFlightPayload: Payload?
         private var preparationScheduled = false
-        private var finalWidthLayoutTask: Task<Void, Never>?
+        private var cancelWidthSettlement: NativeTranscriptGeometryDrivers
+            .WidthSettlementCancellation?
+        private var authorizedWidthGeneration: Int?
         private var userIntentRevision = 1
         private var lastReportedNearBottom: Bool?
         private var lastViewportWidth: CGFloat?
@@ -452,6 +499,15 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         public var inFlightGeometryGeneration: Int? { geometryState.inFlight?.generation }
         public var pendingGeometryEffectiveWidth: CGFloat? {
             geometryState.pending?.effectiveWidth
+        }
+        public var pendingWidthSettlement: TranscriptWidthSettlementTarget? {
+            widthSettlementState.pending
+        }
+        public var activeWidthSettlement: TranscriptWidthSettlementTarget? {
+            widthSettlementState.active
+        }
+        public var desiredWidthSettlement: TranscriptWidthSettlementTarget {
+            widthSettlementState.latest
         }
         public private(set) var lastReconfiguredItemIDs: Set<String> = []
 
@@ -490,6 +546,9 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             self.scrollView = scrollView
             self.collectionView = collectionView
             lastViewportWidth = scrollView.contentSize.width
+            widthSettlementState = TranscriptWidthSettlementState(
+                initialEffectiveWidth: availableWidth
+            )
             NotificationCenter.default.addObserver(
                 self,
                 selector: #selector(clipViewBoundsDidChange),
@@ -511,8 +570,9 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         }
 
         fileprivate func detach() {
-            finalWidthLayoutTask?.cancel()
-            finalWidthLayoutTask = nil
+            cancelWidthSettlement?()
+            cancelWidthSettlement = nil
+            authorizedWidthGeneration = nil
             preparationScheduled = false
             for host in renderMeasurementHosts.values { host.removeFromSuperview() }
             renderMeasurementHosts.removeAll(keepingCapacity: false)
@@ -585,6 +645,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 items: committedItems,
                 rowBuilder: committedRowBuilder,
                 width: committedEffectiveWidth,
+                widthGeneration: appliedGeometryTarget.widthGeneration,
                 sessionID: committedSessionID,
                 disclosures: appliedGeometryTarget.disclosures
             ))
@@ -647,7 +708,16 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         }
 
         private func stageDesiredGeometry(forcesReload: Bool = false) {
-            let width = availableWidth
+            if appliedGeometryTarget.items.isEmpty, geometryState.inFlight == nil {
+                let bootstrapWidth = TranscriptWidthSettlementTarget.normalize(availableWidth)
+                if bootstrapWidth != widthSettlementState.latest.effectiveWidth {
+                    widthSettlementState = TranscriptWidthSettlementState(
+                        initialEffectiveWidth: bootstrapWidth
+                    )
+                }
+            }
+            let widthTarget = widthSettlementState.latest
+            let width = widthTarget.effectiveWidth
             guard width > 1 || desiredItems.isEmpty else { return }
             let geometryItems = desiredItems.map(\.geometryItem)
             let viewportMode: TranscriptGeometryViewportMode
@@ -682,10 +752,12 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 sizes: reusableSizes(
                     for: geometryItems,
                     width: width,
+                    widthGeneration: widthTarget.generation,
                     sessionID: desiredSessionID
                 ),
                 bottomInset: desiredBottomInset,
                 effectiveWidth: width,
+                widthGeneration: widthTarget.generation,
                 viewportIntent: .init(revision: userIntentRevision, mode: viewportMode),
                 forcesReload: forcesReload,
                 sessionID: desiredSessionID,
@@ -703,23 +775,33 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             for id in obsoleteHostIDs {
                 renderMeasurementHosts.removeValue(forKey: id)?.removeFromSuperview()
             }
-            schedulePreparation()
+            if widthSettlementState.pending == nil
+                || authorizedWidthGeneration == widthTarget.generation
+            {
+                schedulePreparation()
+            }
         }
 
         private func reusableSizes(
             for items: [TranscriptGeometryItem],
             width: CGFloat,
+            widthGeneration: Int,
             sessionID: String?
         ) -> [String: TranscriptGeometryItemSize] {
             var result: [String: TranscriptGeometryItemSize] = [:]
             for item in items {
                 guard let size = geometryState.committed.sizes[item.id],
-                      size.matches(item, effectiveWidth: width)
+                      size.matches(
+                        item,
+                        effectiveWidth: width,
+                        widthGeneration: widthGeneration
+                      )
                 else { continue }
                 if item.heightAuthority == .versionedRender {
                     guard let accepted = acceptedRenderHeight(
                         for: item,
                         width: width,
+                        widthGeneration: widthGeneration,
                         sessionID: sessionID
                     ),
                           accepted.key.contentVersion == size.contentVersion,
@@ -755,7 +837,8 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 let item = nativeItem.geometryItem
                 if pending.sizes[item.id]?.matches(
                     item,
-                    effectiveWidth: pending.effectiveWidth
+                    effectiveWidth: pending.effectiveWidth,
+                    widthGeneration: pending.widthGeneration
                 ) == true {
                     continue
                 }
@@ -763,6 +846,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 let renderHeight = acceptedRenderHeight(
                     for: item,
                     width: pending.effectiveWidth,
+                    widthGeneration: pending.widthGeneration,
                     sessionID: payload.sessionID
                 )
                 let host: NSHostingView<AnyView>
@@ -776,6 +860,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     items: payload.items,
                     rowBuilder: payload.rowBuilder,
                     width: pending.effectiveWidth,
+                    widthGeneration: pending.widthGeneration,
                     sessionID: payload.sessionID,
                     disclosures: pending.disclosures
                 )
@@ -790,6 +875,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                 let accepted = renderHeight ?? acceptedRenderHeight(
                     for: item,
                     width: pending.effectiveWidth,
+                    widthGeneration: pending.widthGeneration,
                     sessionID: payload.sessionID
                 )
                 if nativeItem.heightAuthority == .versionedRender, accepted == nil {
@@ -802,6 +888,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     contentVersion: accepted?.key.contentVersion ?? 0,
                     renderPublicationVersion: accepted?.key.renderPublicationVersion ?? 0,
                     effectiveWidth: pending.effectiveWidth,
+                    widthGeneration: pending.widthGeneration,
                     height: height
                 )
                 _ = geometryState.accept(size, intentGeneration: payload.intentGeneration)
@@ -825,6 +912,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         private func acceptedRenderHeight(
             for item: TranscriptGeometryItem,
             width: CGFloat,
+            widthGeneration: Int,
             sessionID: String?
         ) -> NativeTranscriptRenderHeightValue? {
             guard let accepted = acceptedRenderHeights[item.id],
@@ -832,6 +920,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     itemID: item.id,
                     contentRevision: item.contentRevision,
                     outerEffectiveWidth: width,
+                    widthGeneration: widthGeneration,
                     sessionID: sessionID
                   )
             else { return nil }
@@ -843,6 +932,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             items: [NativeTranscriptItem],
             rowBuilder: (Int) -> AnyView,
             width: CGFloat,
+            widthGeneration: Int,
             sessionID: String?,
             disclosures: TranscriptDisclosureGeometryState
         ) -> AnyView {
@@ -853,6 +943,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     itemID: item.id,
                     contentRevision: item.contentRevision,
                     outerEffectiveWidth: width,
+                    widthGeneration: widthGeneration,
                     sessionID: sessionID
                 )
                 context = NativeTranscriptRowRenderContext(
@@ -894,6 +985,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             let previousValue = previouslyAccepted?.value
             let changedOuterWidth = previouslyAccepted.map {
                 $0.provenance.outerEffectiveWidth != provenance.outerEffectiveWidth
+                    || $0.provenance.widthGeneration != provenance.widthGeneration
             } ?? false
             let isAcceptable: Bool
             if changedOuterWidth, let previousValue {
@@ -913,12 +1005,14 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     effectiveWidth: value.key.effectiveWidth
                 )
             }
+            let widthTarget = widthSettlementState.latest
             guard let item = desiredItems.first(where: { $0.id == provenance.itemID }),
                   item.heightAuthority == .versionedRender,
                   provenance == NativeTranscriptRenderHeightProvenance(
                     itemID: item.id,
                     contentRevision: item.contentRevision,
-                    outerEffectiveWidth: availableWidth,
+                    outerEffectiveWidth: widthTarget.effectiveWidth,
+                    widthGeneration: widthTarget.generation,
                     sessionID: desiredSessionID
                   ),
                   isAcceptable
@@ -932,10 +1026,25 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         }
 
         private func launchReadyTransaction() {
+            guard let readyTarget = geometryState.pending, readyTarget.isReady else { return }
+            let beginsWidthSettlement = readyTarget.widthGeneration
+                != widthSettlementState.committed.generation
+                && readyTarget.widthGeneration != widthSettlementState.active?.generation
+            if beginsWidthSettlement {
+                guard widthSettlementState.pending?.generation == readyTarget.widthGeneration,
+                      authorizedWidthGeneration == readyTarget.widthGeneration
+                else { return }
+            }
             guard let transaction = geometryState.beginIfReady(),
                   let payload = pendingPayload,
                   payload.intentGeneration == transaction.intentGeneration
             else { return }
+            if beginsWidthSettlement {
+                _ = widthSettlementState.beginPending(
+                    expectedGeneration: transaction.target.widthGeneration
+                )
+                authorizedWidthGeneration = nil
+            }
             pendingPayload = nil
             inFlightPayload = payload
             geometryDrivers.mutate { [weak self] in
@@ -958,11 +1067,14 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     completionProvenance: transaction.completionProvenance,
                     currentUserIntentRevision: userIntentRevision
                 )
+                _ = widthSettlementState.reject(
+                    generation: transaction.target.widthGeneration
+                )
                 inFlightPayload = nil
                 if geometryState.pending?.isReady == true {
                     launchReadyTransaction()
                 } else if geometryState.pending != nil {
-                    schedulePreparation()
+                    schedulePreparationIfWidthAuthorized()
                 }
                 return
             }
@@ -986,6 +1098,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             assert(widthTransition.preservesFlowLayoutWidthInvariant(
                 horizontalSectionInset: horizontalSectionInset
             ))
+            collectionView.minimumSafeFrameWidth = widthTransition.stagedFrameWidth
             collectionView.setFrameSize(NSSize(
                 width: widthTransition.stagedFrameWidth,
                 height: max(collectionView.frame.height, scrollView.documentVisibleRect.height)
@@ -996,6 +1109,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             // pass lets FlowLayout validate stale attributes against the target frame.
             collectionView.collectionViewLayout?.invalidateLayout()
             collectionView.layoutSubtreeIfNeeded()
+            collectionView.minimumSafeFrameWidth = widthTransition.settledFrameWidth
             collectionView.setFrameSize(NSSize(
                 width: widthTransition.settledFrameWidth,
                 height: max(collectionView.frame.height, scrollView.documentVisibleRect.height)
@@ -1006,6 +1120,8 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             if !transaction.mutationPlan.reloadsAllItems, !hasStructuralChanges {
                 let reconfiguresAll = transaction.previousTarget.effectiveWidth
                     != transaction.target.effectiveWidth
+                    || transaction.previousTarget.widthGeneration
+                        != transaction.target.widthGeneration
                 reconfigureVisibleItems(
                     changedIDs: reconfiguresAll
                         ? Set(committedItems.map(\.id))
@@ -1066,6 +1182,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
                     items: committedItems,
                     rowBuilder: committedRowBuilder,
                     width: committedEffectiveWidth,
+                    widthGeneration: appliedGeometryTarget.widthGeneration,
                     sessionID: committedSessionID,
                     disclosures: appliedGeometryTarget.disclosures
                 ))
@@ -1089,12 +1206,17 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             completionProvenance: TranscriptGeometryCompletionProvenance
         ) {
             guard geometryState.inFlight?.generation == generation else { return }
+            scrollView?.layoutSubtreeIfNeeded()
+            collectionView?.layoutSubtreeIfNeeded()
             let completion = geometryState.complete(
                 transactionGeneration: generation,
                 completionProvenance: completionProvenance,
                 currentUserIntentRevision: userIntentRevision
             )
             guard completion.accepted else { return }
+            _ = widthSettlementState.complete(
+                generation: completionProvenance.widthGeneration
+            )
             geometryCompletionCount += 1
             inFlightPayload = nil
             if let effect = completion.viewportEffect {
@@ -1113,7 +1235,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             if geometryState.pending?.isReady == true {
                 launchReadyTransaction()
             } else if geometryState.pending != nil {
-                schedulePreparation()
+                schedulePreparationIfWidthAuthorized()
             }
         }
 
@@ -1169,12 +1291,57 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
 
         private func viewportWidthDidChange(_ width: CGFloat) {
             guard width > 1 else { return }
+            if appliedGeometryTarget.items.isEmpty, geometryState.inFlight == nil {
+                let bootstrapWidth = TranscriptWidthSettlementTarget.normalize(availableWidth)
+                guard bootstrapWidth != widthSettlementState.latest.effectiveWidth else { return }
+                widthSettlementState = TranscriptWidthSettlementState(
+                    initialEffectiveWidth: bootstrapWidth
+                )
+                authorizedWidthGeneration = nil
+                cancelWidthSettlement?()
+                cancelWidthSettlement = nil
+                stageDesiredGeometry()
+                return
+            }
+            guard let target = widthSettlementState.observe(
+                effectiveWidth: availableWidth
+            ) else { return }
+            stageCollectionFrame(for: target)
+            authorizedWidthGeneration = nil
+            cancelWidthSettlement?()
+            cancelWidthSettlement = geometryDrivers.settleWidth(target) { [weak self] in
+                guard let self, self.widthSettlementState.pending == target else { return }
+                self.cancelWidthSettlement = nil
+                self.authorizedWidthGeneration = target.generation
+                self.schedulePreparation()
+            }
             stageDesiredGeometry()
-            finalWidthLayoutTask?.cancel()
-            finalWidthLayoutTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(80))
-                guard let self, !Task.isCancelled else { return }
-                self.stageDesiredGeometry()
+        }
+
+        private func stageCollectionFrame(for target: TranscriptWidthSettlementTarget) {
+            guard let collectionView, let scrollView else { return }
+            let sectionInset = (collectionView.collectionViewLayout as? NSCollectionViewFlowLayout)?
+                .sectionInset ?? .init()
+            let transition = NativeTranscriptCollectionWidthTransition(
+                currentFrameWidth: collectionView.frame.width,
+                previousItemWidth: appliedGeometryTarget.effectiveWidth,
+                targetItemWidth: target.effectiveWidth,
+                horizontalSectionInset: sectionInset.left + sectionInset.right,
+                minimumClearance: flowLayoutClearance
+            )
+            collectionView.minimumSafeFrameWidth = transition.stagedFrameWidth
+            collectionView.setFrameSize(NSSize(
+                width: transition.stagedFrameWidth,
+                height: max(collectionView.frame.height, scrollView.documentVisibleRect.height)
+            ))
+        }
+
+        private func schedulePreparationIfWidthAuthorized() {
+            guard let pending = geometryState.pending else { return }
+            if widthSettlementState.pending == nil
+                || authorizedWidthGeneration == pending.widthGeneration
+            {
+                schedulePreparation()
             }
         }
 

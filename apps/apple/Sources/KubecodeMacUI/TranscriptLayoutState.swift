@@ -29,6 +29,84 @@ public struct TranscriptScrollGeometry: Equatable, Sendable {
     }
 }
 
+public struct TranscriptWidthSettlementTarget: Hashable, Sendable {
+    public let generation: Int
+    public let effectiveWidth: CGFloat
+
+    public init(generation: Int, effectiveWidth: CGFloat) {
+        self.generation = generation
+        self.effectiveWidth = Self.normalize(effectiveWidth)
+    }
+
+    public static func normalize(_ effectiveWidth: CGFloat) -> CGFloat {
+        floor(max(effectiveWidth, 1))
+    }
+}
+
+public struct TranscriptWidthSettlementState: Equatable, Sendable {
+    public private(set) var committed: TranscriptWidthSettlementTarget
+    public private(set) var active: TranscriptWidthSettlementTarget?
+    public private(set) var pending: TranscriptWidthSettlementTarget?
+    public private(set) var nextGeneration = 1
+    private var lastObservedWidth: CGFloat
+
+    public init(initialEffectiveWidth: CGFloat) {
+        let width = TranscriptWidthSettlementTarget.normalize(initialEffectiveWidth)
+        committed = TranscriptWidthSettlementTarget(generation: 0, effectiveWidth: width)
+        lastObservedWidth = width
+    }
+
+    public var latest: TranscriptWidthSettlementTarget {
+        pending ?? active ?? committed
+    }
+
+    public var retainedTargetCount: Int {
+        (active == nil ? 0 : 1) + (pending == nil ? 0 : 1)
+    }
+
+    @discardableResult
+    public mutating func observe(effectiveWidth: CGFloat) -> TranscriptWidthSettlementTarget? {
+        let width = TranscriptWidthSettlementTarget.normalize(effectiveWidth)
+        guard width != lastObservedWidth else { return nil }
+        lastObservedWidth = width
+        let target = TranscriptWidthSettlementTarget(
+            generation: nextGeneration,
+            effectiveWidth: width
+        )
+        nextGeneration &+= 1
+        pending = target
+        return target
+    }
+
+    @discardableResult
+    public mutating func beginPending(
+        expectedGeneration: Int
+    ) -> TranscriptWidthSettlementTarget? {
+        guard active == nil,
+              let pending,
+              pending.generation == expectedGeneration
+        else { return nil }
+        active = pending
+        self.pending = nil
+        return pending
+    }
+
+    @discardableResult
+    public mutating func complete(generation: Int) -> Bool {
+        guard let active, active.generation == generation else { return false }
+        committed = active
+        self.active = nil
+        return true
+    }
+
+    @discardableResult
+    public mutating func reject(generation: Int) -> Bool {
+        guard active?.generation == generation else { return false }
+        active = nil
+        return true
+    }
+}
+
 public struct NativeTranscriptRenderHeightKey: Hashable, Sendable {
     public let contentVersion: Int
     public let renderPublicationVersion: Int
@@ -180,6 +258,7 @@ public struct TranscriptGeometryItemSize: Hashable, Sendable {
     public let contentVersion: Int
     public let renderPublicationVersion: Int
     public let effectiveWidth: CGFloat
+    public let widthGeneration: Int
     public let height: CGFloat
 
     public init(
@@ -189,6 +268,7 @@ public struct TranscriptGeometryItemSize: Hashable, Sendable {
         contentVersion: Int,
         renderPublicationVersion: Int,
         effectiveWidth: CGFloat,
+        widthGeneration: Int = 0,
         height: CGFloat
     ) {
         self.itemID = itemID
@@ -197,15 +277,21 @@ public struct TranscriptGeometryItemSize: Hashable, Sendable {
         self.contentVersion = contentVersion
         self.renderPublicationVersion = renderPublicationVersion
         self.effectiveWidth = max(effectiveWidth, 1).rounded(.toNearestOrAwayFromZero)
+        self.widthGeneration = widthGeneration
         self.height = max(height, 1)
     }
 
-    public func matches(_ item: TranscriptGeometryItem, effectiveWidth: CGFloat) -> Bool {
+    public func matches(
+        _ item: TranscriptGeometryItem,
+        effectiveWidth: CGFloat,
+        widthGeneration: Int = 0
+    ) -> Bool {
         itemID == item.id
             && contentRevision == item.contentRevision
             && layoutRevision == item.layoutRevision
             && self.effectiveWidth
                 == max(effectiveWidth, 1).rounded(.toNearestOrAwayFromZero)
+            && self.widthGeneration == widthGeneration
             && (item.heightAuthority == .synchronousHosting
                 ? contentVersion == 0 && renderPublicationVersion == 0
                 : contentVersion > 0 && renderPublicationVersion > 0)
@@ -277,6 +363,7 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
     public private(set) var sizes: [String: TranscriptGeometryItemSize]
     public let bottomInset: CGFloat
     public let effectiveWidth: CGFloat
+    public let widthGeneration: Int
     public let viewportIntent: TranscriptGeometryViewportIntent
     public let forcesReload: Bool
     public let sessionID: String?
@@ -287,6 +374,7 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
         sizes: [String: TranscriptGeometryItemSize],
         bottomInset: CGFloat,
         effectiveWidth: CGFloat,
+        widthGeneration: Int = 0,
         viewportIntent: TranscriptGeometryViewportIntent,
         forcesReload: Bool = false,
         sessionID: String? = nil,
@@ -296,6 +384,7 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
         self.sizes = sizes
         self.bottomInset = max(bottomInset, 0)
         self.effectiveWidth = max(effectiveWidth, 1).rounded(.toNearestOrAwayFromZero)
+        self.widthGeneration = widthGeneration
         self.viewportIntent = viewportIntent
         self.forcesReload = forcesReload
         self.sessionID = sessionID
@@ -317,7 +406,11 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
 
     public var isReady: Bool {
         hasUniqueItemIDs && hasValidDisclosureProvenance && items.allSatisfy { item in
-            sizes[item.id]?.matches(item, effectiveWidth: effectiveWidth) == true
+            sizes[item.id]?.matches(
+                item,
+                effectiveWidth: effectiveWidth,
+                widthGeneration: widthGeneration
+            ) == true
         }
     }
 
@@ -327,6 +420,7 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
             sizes: sizes,
             bottomInset: bottomInset,
             effectiveWidth: effectiveWidth,
+            widthGeneration: widthGeneration,
             viewportIntent: viewportIntent,
             forcesReload: false,
             sessionID: sessionID,
@@ -337,7 +431,11 @@ public struct TranscriptGeometryTarget: Hashable, Sendable {
     @discardableResult
     public mutating func accept(_ size: TranscriptGeometryItemSize) -> Bool {
         guard let item = items.first(where: { $0.id == size.itemID }),
-              size.matches(item, effectiveWidth: effectiveWidth)
+              size.matches(
+                item,
+                effectiveWidth: effectiveWidth,
+                widthGeneration: widthGeneration
+              )
         else { return false }
         if let previous = sizes[item.id] {
             guard size.isStrictlyNewer(than: previous) else { return false }
@@ -431,6 +529,7 @@ public struct TranscriptGeometryCompletionProvenance: Hashable, Sendable {
     public let items: [TranscriptGeometryItem]
     public let sizes: [String: TranscriptGeometryItemSize]
     public let effectiveWidth: CGFloat
+    public let widthGeneration: Int
     public let disclosures: TranscriptDisclosureGeometryState
 
     public init(
@@ -438,12 +537,14 @@ public struct TranscriptGeometryCompletionProvenance: Hashable, Sendable {
         items: [TranscriptGeometryItem],
         sizes: [String: TranscriptGeometryItemSize],
         effectiveWidth: CGFloat,
+        widthGeneration: Int = 0,
         disclosures: TranscriptDisclosureGeometryState
     ) {
         self.sessionID = sessionID
         self.items = items
         self.sizes = sizes
         self.effectiveWidth = max(effectiveWidth, 1).rounded(.toNearestOrAwayFromZero)
+        self.widthGeneration = widthGeneration
         self.disclosures = disclosures
     }
 
@@ -453,6 +554,7 @@ public struct TranscriptGeometryCompletionProvenance: Hashable, Sendable {
             items: target.items,
             sizes: target.sizes,
             effectiveWidth: target.effectiveWidth,
+            widthGeneration: target.widthGeneration,
             disclosures: target.disclosures
         )
     }

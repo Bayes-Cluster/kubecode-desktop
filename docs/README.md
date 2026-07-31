@@ -38,6 +38,7 @@
 | [0032](adr/0032-stable-markdown-row-session-ownership.md) | Accepted | Stable scoped Markdown row sessions, bounded recovery, and deterministic teardown |
 | [0033](adr/0033-stable-bounded-transcript-disclosures.md) | Accepted | Stable semantic identity and bounded native Working/Tool disclosure content |
 | [0034](adr/0034-atomic-disclosure-geometry-transactions.md) | Accepted | Atomic disclosure presentation and transcript geometry transactions |
+| [0035](adr/0035-latest-only-transcript-width-settlement.md) | Accepted | Latest-only versioned transcript width settlement |
 
 Proposed ADRs are implementation-ready recommendations. Move one to Accepted
 before starting work that depends on its long-term boundary.
