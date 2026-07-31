@@ -234,6 +234,55 @@ struct PreparedMarkdownRendererTests {
         let settled = try #require(store.latestRenderInputs(rowID: "image"))
         #expect(settled.attachmentResolutionGeneration == 1)
         #expect(settled.renderPublicationVersion == 2)
+        let measured = try #require(store.heightCommit(
+            rowID: "image",
+            width: 420,
+            verticalInset: 4
+        ))
+
+        let item = TranscriptGeometryItem(
+            id: "image",
+            contentRevision: 1,
+            layoutRevision: 0,
+            heightAuthority: .versionedRender
+        )
+        let initialSize = TranscriptGeometryItemSize(
+            itemID: "image",
+            contentRevision: 1,
+            layoutRevision: 0,
+            contentVersion: settled.contentVersion,
+            renderPublicationVersion: 1,
+            effectiveWidth: 420,
+            height: 20
+        )
+        let settledSize = TranscriptGeometryItemSize(
+            itemID: "image",
+            contentRevision: 1,
+            layoutRevision: 0,
+            contentVersion: settled.contentVersion,
+            renderPublicationVersion: settled.renderPublicationVersion,
+            effectiveWidth: 420,
+            height: measured.height
+        )
+        let viewport = TranscriptGeometryViewportIntent(revision: 1, mode: .followTail)
+        var geometry = TranscriptGeometryTransactionState(committed: .init(
+            items: [item],
+            sizes: ["image": initialSize],
+            bottomInset: 80,
+            effectiveWidth: 420,
+            viewportIntent: viewport
+        ))
+        let settledTarget = TranscriptGeometryTarget(
+            items: [item],
+            sizes: ["image": settledSize],
+            bottomInset: 80,
+            effectiveWidth: 420,
+            viewportIntent: viewport
+        )
+        let settlementIntent = geometry.submit(settledTarget)
+        #expect(settlementIntent == 1)
+        let geometryTransaction = geometry.beginIfReady()
+        #expect(geometryTransaction?.generation == 1)
 
         let unchanged = store.submit(
             rowID: "image",
@@ -246,6 +295,9 @@ struct PreparedMarkdownRendererTests {
         #expect(unchanged == .unchanged(contentVersion: 1))
         #expect(callCount == 1)
         #expect(store.latestRenderInputs(rowID: "image") == settled)
+        let duplicateGeometry = geometry.submit(settledTarget)
+        #expect(duplicateGeometry == nil)
+        #expect(geometry.nextTransactionGeneration == 2)
     }
 
     @Test @MainActor func visible_and_hidden_hosts_share_the_prepared_row_commit() async throws {

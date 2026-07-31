@@ -11,19 +11,96 @@ public enum NativeTranscriptResizePolicy: Hashable, Sendable {
     case animated
 }
 
-@MainActor
-public struct NativeTranscriptRowRenderContext {
+public struct NativeTranscriptCollectionWidthTransition: Equatable, Sendable {
+    public struct LayoutVisiblePhase: Equatable, Sendable {
+        public let itemWidth: CGFloat
+        public let collectionFrameWidth: CGFloat
+
+        public init(itemWidth: CGFloat, collectionFrameWidth: CGFloat) {
+            self.itemWidth = itemWidth
+            self.collectionFrameWidth = collectionFrameWidth
+        }
+    }
+
+    public let stagedFrameWidth: CGFloat
+    public let settledFrameWidth: CGFloat
+    public let minimumClearance: CGFloat
+    public let layoutVisiblePhases: [LayoutVisiblePhase]
+
+    public init(
+        currentFrameWidth: CGFloat,
+        previousItemWidth: CGFloat,
+        targetItemWidth: CGFloat,
+        horizontalSectionInset: CGFloat,
+        minimumClearance: CGFloat
+    ) {
+        let margin = max(minimumClearance, 1)
+        self.minimumClearance = margin
+        let previousRequiredWidth = previousItemWidth + horizontalSectionInset + margin
+        let targetRequiredWidth = targetItemWidth + horizontalSectionInset + margin
+        stagedFrameWidth = max(
+            currentFrameWidth,
+            max(previousRequiredWidth, targetRequiredWidth)
+        )
+        settledFrameWidth = targetRequiredWidth
+        layoutVisiblePhases = [
+            LayoutVisiblePhase(
+                itemWidth: previousItemWidth,
+                collectionFrameWidth: stagedFrameWidth
+            ),
+            LayoutVisiblePhase(
+                itemWidth: targetItemWidth,
+                collectionFrameWidth: stagedFrameWidth
+            ),
+            LayoutVisiblePhase(
+                itemWidth: targetItemWidth,
+                collectionFrameWidth: settledFrameWidth
+            ),
+        ]
+    }
+
+    public func preservesFlowLayoutWidthInvariant(horizontalSectionInset: CGFloat) -> Bool {
+        layoutVisiblePhases.allSatisfy {
+            $0.itemWidth < $0.collectionFrameWidth - horizontalSectionInset
+        }
+    }
+}
+
+public struct NativeTranscriptRenderHeightProvenance: Hashable, Sendable {
     public let itemID: String
     public let contentRevision: Int
-    private let publishAction: (NativeTranscriptRenderHeightValue) -> Void
+    public let outerEffectiveWidth: CGFloat
+    public let sessionID: String?
 
-    fileprivate init(
+    public init(
         itemID: String,
         contentRevision: Int,
-        publishAction: @escaping (NativeTranscriptRenderHeightValue) -> Void
+        outerEffectiveWidth: CGFloat,
+        sessionID: String?
     ) {
         self.itemID = itemID
         self.contentRevision = contentRevision
+        self.outerEffectiveWidth = max(outerEffectiveWidth, 1)
+            .rounded(.toNearestOrAwayFromZero)
+        self.sessionID = sessionID
+    }
+}
+
+@MainActor
+public struct NativeTranscriptRowRenderContext {
+    public let provenance: NativeTranscriptRenderHeightProvenance
+    private let publishAction: (NativeTranscriptRenderHeightValue) -> Void
+
+    public var itemID: String { provenance.itemID }
+    public var contentRevision: Int { provenance.contentRevision }
+    public var outerEffectiveWidth: CGFloat { provenance.outerEffectiveWidth }
+    public var sessionID: String? { provenance.sessionID }
+
+    fileprivate init(
+        provenance: NativeTranscriptRenderHeightProvenance,
+        publishAction: @escaping (NativeTranscriptRenderHeightValue) -> Void
+    ) {
+        self.provenance = provenance
         self.publishAction = publishAction
     }
 
@@ -49,6 +126,8 @@ private final class TranscriptHostingItem: NSCollectionViewItem {
 
     override func loadView() {
         view = NSView(frame: .zero)
+        view.wantsLayer = true
+        view.layer?.masksToBounds = true
         hostingView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(hostingView)
         NSLayoutConstraint.activate([
@@ -64,23 +143,34 @@ private final class TranscriptHostingItem: NSCollectionViewItem {
     }
 }
 
-@MainActor
 public struct NativeTranscriptItem: Identifiable, Hashable, Sendable {
     public let id: String
     public let contentRevision: Int
     public let layoutRevision: Int
     public let resizePolicy: NativeTranscriptResizePolicy
+    public let heightAuthority: NativeTranscriptHeightAuthority
 
     public init(
         id: String,
         contentRevision: Int,
         layoutRevision: Int = 0,
-        resizePolicy: NativeTranscriptResizePolicy = .immediate
+        resizePolicy: NativeTranscriptResizePolicy = .immediate,
+        heightAuthority: NativeTranscriptHeightAuthority = .synchronousHosting
     ) {
         self.id = id
         self.contentRevision = contentRevision
         self.layoutRevision = layoutRevision
         self.resizePolicy = resizePolicy
+        self.heightAuthority = heightAuthority
+    }
+
+    fileprivate var geometryItem: TranscriptGeometryItem {
+        TranscriptGeometryItem(
+            id: id,
+            contentRevision: contentRevision,
+            layoutRevision: layoutRevision,
+            heightAuthority: heightAuthority
+        )
     }
 }
 
@@ -126,9 +216,9 @@ public struct TranscriptCollectionUpdatePlan: Equatable, Sendable {
 
         let previousIDSet = Set(previousIDs)
         let currentIDSet = Set(currentIDs)
-        let previousCommon = previousIDs.filter(currentIDSet.contains)
-        let currentCommon = currentIDs.filter(previousIDSet.contains)
-        guard previousCommon == currentCommon else { return .reloadAll }
+        guard previousIDs.filter(currentIDSet.contains)
+                == currentIDs.filter(previousIDSet.contains)
+        else { return .reloadAll }
 
         let previousByID = Dictionary(uniqueKeysWithValues: previous.map { ($0.id, $0) })
         let changed = IndexSet(current.indices.filter { index in
@@ -145,9 +235,8 @@ public struct TranscriptCollectionUpdatePlan: Equatable, Sendable {
             changedIndexes: changed,
             insertedIndexes: inserted,
             deletedIndexes: deleted,
-            animatesChanges: inserted.isEmpty && deleted.isEmpty && !changed.isEmpty && changed.allSatisfy {
-                current[$0].resizePolicy == .animated
-            }
+            animatesChanges: inserted.isEmpty && deleted.isEmpty && !changed.isEmpty
+                && changed.allSatisfy { current[$0].resizePolicy == .animated }
         )
     }
 
@@ -158,7 +247,8 @@ public struct TranscriptCollectionUpdatePlan: Equatable, Sendable {
             return
         }
         if !insertedIndexes.isEmpty || !deletedIndexes.isEmpty
-            || !other.insertedIndexes.isEmpty || !other.deletedIndexes.isEmpty {
+            || !other.insertedIndexes.isEmpty || !other.deletedIndexes.isEmpty
+        {
             self = .reloadAll
             return
         }
@@ -171,12 +261,57 @@ public struct TranscriptCollectionUpdatePlan: Equatable, Sendable {
 }
 
 @MainActor
+public struct NativeTranscriptGeometryDrivers {
+    public typealias Stage = @MainActor (@escaping @MainActor () -> Void) -> Void
+
+    private let preparationStage: Stage
+    private let mutationStage: Stage
+    private let completionStage: Stage
+
+    public init(
+        preparation: @escaping Stage,
+        mutation: @escaping Stage,
+        completion: @escaping Stage
+    ) {
+        preparationStage = preparation
+        mutationStage = mutation
+        completionStage = completion
+    }
+
+    public static var automatic: NativeTranscriptGeometryDrivers {
+        NativeTranscriptGeometryDrivers(
+            preparation: { action in
+                Task { @MainActor in
+                    await Task.yield()
+                    action()
+                }
+            },
+            mutation: { action in action() },
+            completion: { action in action() }
+        )
+    }
+
+    fileprivate func prepare(_ action: @escaping @MainActor () -> Void) {
+        preparationStage(action)
+    }
+
+    fileprivate func mutate(_ action: @escaping @MainActor () -> Void) {
+        mutationStage(action)
+    }
+
+    fileprivate func complete(_ action: @escaping @MainActor () -> Void) {
+        completionStage(action)
+    }
+}
+
+@MainActor
 public struct NativeTranscriptCollectionView: NSViewRepresentable {
     public let items: [NativeTranscriptItem]
     public let sessionID: String?
     public let outputRevision: String
     public let bottomInset: CGFloat
     public let scrollController: TranscriptScrollController
+    private let geometryDrivers: NativeTranscriptGeometryDrivers
     private let rowBuilder: (Int) -> AnyView
 
     public init(
@@ -185,6 +320,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         outputRevision: String,
         bottomInset: CGFloat,
         scrollController: TranscriptScrollController,
+        geometryDrivers: NativeTranscriptGeometryDrivers = .automatic,
         rowBuilder: @escaping (Int) -> AnyView
     ) {
         self.items = items
@@ -192,6 +328,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         self.outputRevision = outputRevision
         self.bottomInset = bottomInset
         self.scrollController = scrollController
+        self.geometryDrivers = geometryDrivers
         self.rowBuilder = rowBuilder
     }
 
@@ -206,7 +343,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
         scrollView.automaticallyAdjustsContentInsets = false
-        scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: bottomInset, right: 0)
+        scrollView.contentInsets = .init()
         scrollView.contentView.postsBoundsChangedNotifications = true
 
         let collectionView = NativeTranscriptCollectionNSView(frame: .zero)
@@ -214,7 +351,7 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         collectionView.isSelectable = false
         collectionView.allowsEmptySelection = true
         collectionView.frame = scrollView.contentView.bounds
-        collectionView.autoresizingMask = [.width]
+        collectionView.autoresizingMask = []
         let layout = NSCollectionViewFlowLayout()
         layout.minimumLineSpacing = 18
         layout.minimumInteritemSpacing = 0
@@ -239,42 +376,70 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
     @MainActor
     public final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegateFlowLayout {
         private struct AcceptedRenderHeight {
-            let contentRevision: Int
+            let provenance: NativeTranscriptRenderHeightProvenance
             let value: NativeTranscriptRenderHeightValue
         }
 
-        private var items: [NativeTranscriptItem]
-        private var pendingItems: [NativeTranscriptItem]
-        private var rowBuilder: (Int) -> AnyView
-        private var pendingRowBuilder: (Int) -> AnyView
-        private var sessionID: String?
+        private struct Payload {
+            let intentGeneration: Int
+            let items: [NativeTranscriptItem]
+            let rowBuilder: (Int) -> AnyView
+            let sessionID: String?
+        }
+
+        private var committedItems: [NativeTranscriptItem] = []
+        private var committedRowBuilder: (Int) -> AnyView = { _ in AnyView(EmptyView()) }
+        private var committedBottomInset: CGFloat = 0
+        private var committedSessionID: String?
+        private var desiredItems: [NativeTranscriptItem]
+        private var desiredRowBuilder: (Int) -> AnyView
+        private var desiredBottomInset: CGFloat
+        private var desiredSessionID: String?
         private var outputRevision: String
-        private var bottomInset: CGFloat
+        private var scrollRequestSequence: Int
         private var scrollController: TranscriptScrollController
+        private let geometryDrivers: NativeTranscriptGeometryDrivers
         private weak var scrollView: NSScrollView?
         private weak var collectionView: NativeTranscriptCollectionNSView?
-        private let measurementHost = NSHostingView(rootView: AnyView(EmptyView()))
-        private var heightCache = TranscriptHeightCache()
-        private var renderHeights: [String: AcceptedRenderHeight] = [:]
-        private var layoutGate = TranscriptLayoutGate()
-        private var pendingLayoutTask: Task<Void, Never>?
+        private let synchronousMeasurementHost = NSHostingView(rootView: AnyView(EmptyView()))
+        private var renderMeasurementHosts: [String: NSHostingView<AnyView>] = [:]
+        private var acceptedRenderHeights: [String: AcceptedRenderHeight] = [:]
+        private var geometryState: TranscriptGeometryTransactionState
+        private var appliedGeometryTarget: TranscriptGeometryTarget
+        private var pendingPayload: Payload?
+        private var inFlightPayload: Payload?
+        private var preparationScheduled = false
         private var finalWidthLayoutTask: Task<Void, Never>?
-        private var semanticRevision = 0
-        private var requiresFullReload = false
-        private var pendingFollowTail = false
+        private var userIntentRevision = 1
         private var lastReportedNearBottom: Bool?
         private var lastViewportWidth: CGFloat?
         private var isLiveScrolling = false
 
+        public private(set) var geometryMutationCount = 0
+        public private(set) var geometryCompletionCount = 0
+        public var inFlightGeometryGeneration: Int? { geometryState.inFlight?.generation }
+        public var pendingGeometryEffectiveWidth: CGFloat? {
+            geometryState.pending?.effectiveWidth
+        }
+
         init(parent: NativeTranscriptCollectionView) {
-            items = parent.items
-            pendingItems = parent.items
-            rowBuilder = parent.rowBuilder
-            pendingRowBuilder = parent.rowBuilder
-            sessionID = parent.sessionID
+            desiredItems = parent.items
+            desiredRowBuilder = parent.rowBuilder
+            desiredBottomInset = parent.bottomInset
+            desiredSessionID = parent.sessionID
             outputRevision = parent.outputRevision
-            bottomInset = parent.bottomInset
+            scrollRequestSequence = parent.scrollController.scrollRequestSequence
             scrollController = parent.scrollController
+            geometryDrivers = parent.geometryDrivers
+            let initialGeometry = TranscriptGeometryTarget(
+                items: [],
+                sizes: [:],
+                bottomInset: 0,
+                effectiveWidth: 1,
+                viewportIntent: .init(revision: 1, mode: .followTail)
+            )
+            geometryState = TranscriptGeometryTransactionState(committed: initialGeometry)
+            appliedGeometryTarget = initialGeometry
         }
 
         fileprivate func attach(
@@ -305,10 +470,11 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         }
 
         fileprivate func detach() {
-            pendingLayoutTask?.cancel()
-            pendingLayoutTask = nil
             finalWidthLayoutTask?.cancel()
             finalWidthLayoutTask = nil
+            preparationScheduled = false
+            for host in renderMeasurementHosts.values { host.removeFromSuperview() }
+            renderMeasurementHosts.removeAll(keepingCapacity: false)
             NotificationCenter.default.removeObserver(self)
             collectionView = nil
             scrollView = nil
@@ -316,57 +482,43 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
         }
 
         fileprivate func apply(parent: NativeTranscriptCollectionView, initial: Bool) {
-            let changedSession = sessionID != parent.sessionID
-            let changedItems = pendingItems != parent.items
-            let changedInset = abs(bottomInset - parent.bottomInset) >= 0.5
+            let changedSession = desiredSessionID != parent.sessionID
+            let changedItems = desiredItems != parent.items
+            let changedInset = abs(desiredBottomInset - parent.bottomInset) >= 0.5
             let changedOutput = outputRevision != parent.outputRevision
-            let changedScrollRequest = scrollController.scrollRequestSequence
+            let changedScrollRequest = scrollRequestSequence
                 != parent.scrollController.scrollRequestSequence
-            let updatePlan = initial || changedSession
-                ? TranscriptCollectionUpdatePlan.reloadAll
-                : TranscriptCollectionUpdatePlan.between(previous: pendingItems, current: parent.items)
 
-            if changedSession {
-                heightCache.removeAll()
-                renderHeights.removeAll(keepingCapacity: true)
-            } else if !updatePlan.reloadsAllItems {
-                for index in updatePlan.changedIndexes where parent.items.indices.contains(index) {
-                    heightCache.remove(id: parent.items[index].id)
-                    renderHeights.removeValue(forKey: parent.items[index].id)
-                }
-            }
-            if initial || changedSession {
-                requiresFullReload = true
-            }
-            if changedInset {
-                scrollView?.contentInsets.bottom = parent.bottomInset
-            }
-
-            pendingItems = parent.items
-            pendingRowBuilder = parent.rowBuilder
-            sessionID = parent.sessionID
+            desiredItems = parent.items
+            desiredRowBuilder = parent.rowBuilder
+            desiredBottomInset = parent.bottomInset
+            desiredSessionID = parent.sessionID
             outputRevision = parent.outputRevision
-            bottomInset = parent.bottomInset
+            scrollRequestSequence = parent.scrollController.scrollRequestSequence
             scrollController = parent.scrollController
 
             if changedSession {
+                acceptedRenderHeights.removeAll(keepingCapacity: true)
+                removeRenderMeasurementHosts()
                 scrollController.resumeFollowing()
+                userIntentRevision &+= 1
             }
-            if changedItems || changedInset || changedSession || initial {
-                semanticRevision &+= 1
-                scheduleLayout(preserveAnchor: !scrollController.followsOutput)
+            if changedScrollRequest {
+                userIntentRevision &+= 1
+            }
+            if changedOutput, !initial {
+                _ = scrollController.outputDidChange()
             }
 
-            var shouldFollow = initial || changedSession || changedScrollRequest
-            if changedOutput, !initial {
-                shouldFollow = scrollController.outputDidChange() || shouldFollow
-            }
-            if shouldFollow, scrollController.followsOutput {
-                pendingFollowTail = true
-                if !(changedItems || changedInset || changedSession || initial) {
-                    scheduleLayout(preserveAnchor: false)
+            guard initial || changedSession || changedItems || changedInset || changedScrollRequest
+            else { return }
+            if availableWidth <= 1, !desiredItems.isEmpty {
+                geometryDrivers.prepare { [weak self] in
+                    self?.stageDesiredGeometry(forcesReload: initial || changedSession)
                 }
+                return
             }
+            stageDesiredGeometry(forcesReload: initial || changedSession)
         }
 
         public func numberOfSections(in collectionView: NSCollectionView) -> Int { 1 }
@@ -375,17 +527,23 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             _ collectionView: NSCollectionView,
             numberOfItemsInSection section: Int
         ) -> Int {
-            items.count
+            committedItems.count
         }
 
         public func collectionView(
             _ collectionView: NSCollectionView,
             itemForRepresentedObjectAt indexPath: IndexPath
         ) -> NSCollectionViewItem {
-            let item = TranscriptHostingItem()
-            guard items.indices.contains(indexPath.item) else { return item }
-            item.apply(rowContent(at: indexPath.item, width: availableWidth))
-            return item
+            let hostingItem = TranscriptHostingItem()
+            guard committedItems.indices.contains(indexPath.item) else { return hostingItem }
+            hostingItem.apply(rowContent(
+                at: indexPath.item,
+                items: committedItems,
+                rowBuilder: committedRowBuilder,
+                width: committedEffectiveWidth,
+                sessionID: committedSessionID
+            ))
+            return hostingItem
         }
 
         public func collectionView(
@@ -393,64 +551,250 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             layout collectionViewLayout: NSCollectionViewLayout,
             sizeForItemAt indexPath: IndexPath
         ) -> NSSize {
-            guard items.indices.contains(indexPath.item) else {
-                return NSSize(width: availableWidth, height: 1)
-            }
-            let item = items[indexPath.item]
-            let width = availableWidth
-            let key = TranscriptHeightCache.Key(
-                id: item.id,
-                contentRevision: item.contentRevision,
-                layoutRevision: item.layoutRevision,
-                renderHeightRevision: renderHeights[item.id].flatMap { accepted in
-                    accepted.contentRevision == item.contentRevision
-                        ? accepted.value.key.renderPublicationVersion
-                        : nil
-                } ?? 0,
-                width: width
+            let itemWidth = committedEffectiveWidth
+            let sectionInset = (collectionViewLayout as? NSCollectionViewFlowLayout)?
+                .sectionInset ?? .init()
+            let contentInset = scrollView?.contentInsets ?? .init()
+            let maximumItemWidth = collectionView.bounds.width
+                - sectionInset.left - sectionInset.right
+                - contentInset.left - contentInset.right
+            assert(
+                maximumItemWidth - itemWidth
+                    >= flowLayoutClearance,
+                "Transcript item width \(itemWidth) is invalid for collection width "
+                    + "\(collectionView.bounds.width), section inset \(sectionInset), "
+                    + "and content inset \(contentInset)"
             )
-            if let height = heightCache.height(for: key) {
-                return NSSize(width: width, height: height)
+            guard committedItems.indices.contains(indexPath.item) else {
+                return NSSize(width: itemWidth, height: 1)
             }
-            measurementHost.rootView = rowContent(at: indexPath.item, width: width)
-            measurementHost.frame = NSRect(x: 0, y: 0, width: width, height: 10_000)
-            let height = max(1, ceil(measurementHost.fittingSize.height))
-            heightCache.insert(height, for: key)
-            return NSSize(width: width, height: height)
+            let item = committedItems[indexPath.item]
+            let height = appliedGeometryTarget.sizes[item.id]?.height ?? 1
+            return NSSize(width: itemWidth, height: height)
         }
 
-        private func viewportWidthDidChange(_ width: CGFloat) {
-            guard width > 1 else { return }
-            requiresFullReload = true
-            semanticRevision &+= 1
-            scheduleLayout(preserveAnchor: true)
-            finalWidthLayoutTask?.cancel()
-            finalWidthLayoutTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(80))
-                guard let self, !Task.isCancelled else { return }
-                self.semanticRevision &+= 1
-                self.scheduleLayout(preserveAnchor: true)
-            }
+        private var committedEffectiveWidth: CGFloat {
+            appliedGeometryTarget.effectiveWidth
         }
 
         private var availableWidth: CGFloat {
-            let inset = (collectionView?.collectionViewLayout as? NSCollectionViewFlowLayout)?.sectionInset
-                ?? NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-            return max((collectionView?.bounds.width ?? 1) - inset.left - inset.right, 1)
+            let inset = (collectionView?.collectionViewLayout as? NSCollectionViewFlowLayout)?
+                .sectionInset ?? .init()
+            let viewportWidth = scrollView?.contentSize.width ?? 0
+            let sourceWidth = viewportWidth > 1
+                ? viewportWidth
+                : (collectionView?.bounds.width ?? 1)
+            return floor(max(
+                sourceWidth
+                    - inset.left - inset.right
+                    - flowLayoutClearance,
+                1
+            ))
         }
 
-        private func rowContent(at index: Int, width: CGFloat) -> AnyView {
+        private var flowLayoutClearance: CGFloat {
+            guard let scrollView, scrollView.hasVerticalScroller else { return 1 }
+            let controlSize = scrollView.verticalScroller?.controlSize ?? .regular
+            return NSScroller.scrollerWidth(
+                for: controlSize,
+                scrollerStyle: scrollView.scrollerStyle
+            ) + 1
+        }
+
+        private func stageDesiredGeometry(forcesReload: Bool = false) {
+            let width = availableWidth
+            guard width > 1 || desiredItems.isEmpty else { return }
+            let geometryItems = desiredItems.map(\.geometryItem)
+            let viewportMode: TranscriptGeometryViewportMode
+            if scrollController.followsOutput {
+                viewportMode = .followTail
+            } else if let anchor = viewportAnchor() {
+                viewportMode = .preserve(anchor)
+            } else if let first = committedItems.first ?? desiredItems.first {
+                viewportMode = .preserve(.init(itemID: first.id, offset: 0))
+            } else {
+                viewportMode = .followTail
+            }
+            let target = TranscriptGeometryTarget(
+                items: geometryItems,
+                sizes: reusableSizes(
+                    for: geometryItems,
+                    width: width,
+                    sessionID: desiredSessionID
+                ),
+                bottomInset: desiredBottomInset,
+                effectiveWidth: width,
+                viewportIntent: .init(revision: userIntentRevision, mode: viewportMode),
+                forcesReload: forcesReload
+            )
+            guard let intentGeneration = geometryState.submit(target) else { return }
+            pendingPayload = Payload(
+                intentGeneration: intentGeneration,
+                items: desiredItems,
+                rowBuilder: desiredRowBuilder,
+                sessionID: desiredSessionID
+            )
+            let desiredIDs = Set(desiredItems.map(\.id))
+            let obsoleteHostIDs = renderMeasurementHosts.keys.filter { !desiredIDs.contains($0) }
+            for id in obsoleteHostIDs {
+                renderMeasurementHosts.removeValue(forKey: id)?.removeFromSuperview()
+            }
+            schedulePreparation()
+        }
+
+        private func reusableSizes(
+            for items: [TranscriptGeometryItem],
+            width: CGFloat,
+            sessionID: String?
+        ) -> [String: TranscriptGeometryItemSize] {
+            var result: [String: TranscriptGeometryItemSize] = [:]
+            for item in items {
+                guard let size = geometryState.committed.sizes[item.id],
+                      size.matches(item, effectiveWidth: width)
+                else { continue }
+                if item.heightAuthority == .versionedRender {
+                    guard let accepted = acceptedRenderHeight(
+                        for: item,
+                        width: width,
+                        sessionID: sessionID
+                    ),
+                          accepted.key.contentVersion == size.contentVersion,
+                          accepted.key.renderPublicationVersion == size.renderPublicationVersion
+                    else { continue }
+                }
+                result[item.id] = size
+            }
+            return result
+        }
+
+        private func schedulePreparation() {
+            guard !preparationScheduled else { return }
+            preparationScheduled = true
+            geometryDrivers.prepare { [weak self] in
+                guard let self else { return }
+                self.preparationScheduled = false
+                self.prepareLatestGeometry()
+            }
+        }
+
+        private func prepareLatestGeometry() {
+            guard let payload = pendingPayload,
+                  let pending = geometryState.pending,
+                  payload.intentGeneration < geometryState.nextIntentGeneration
+            else {
+                launchReadyTransaction()
+                return
+            }
+
+            for index in payload.items.indices {
+                let nativeItem = payload.items[index]
+                let item = nativeItem.geometryItem
+                if pending.sizes[item.id]?.matches(
+                    item,
+                    effectiveWidth: pending.effectiveWidth
+                ) == true {
+                    continue
+                }
+
+                let renderHeight = acceptedRenderHeight(
+                    for: item,
+                    width: pending.effectiveWidth,
+                    sessionID: payload.sessionID
+                )
+                let host: NSHostingView<AnyView>
+                if nativeItem.heightAuthority == .versionedRender {
+                    host = renderMeasurementHost(for: item.id)
+                } else {
+                    host = synchronousMeasurementHost
+                }
+                host.rootView = rowContent(
+                    at: index,
+                    items: payload.items,
+                    rowBuilder: payload.rowBuilder,
+                    width: pending.effectiveWidth,
+                    sessionID: payload.sessionID
+                )
+                host.frame = NSRect(
+                    x: -100_000,
+                    y: -100_000,
+                    width: pending.effectiveWidth,
+                    height: 10_000
+                )
+                host.layoutSubtreeIfNeeded()
+                let height = max(1, ceil(host.fittingSize.height))
+                let accepted = renderHeight ?? acceptedRenderHeight(
+                    for: item,
+                    width: pending.effectiveWidth,
+                    sessionID: payload.sessionID
+                )
+                if nativeItem.heightAuthority == .versionedRender, accepted == nil {
+                    continue
+                }
+                let size = TranscriptGeometryItemSize(
+                    itemID: item.id,
+                    contentRevision: item.contentRevision,
+                    layoutRevision: item.layoutRevision,
+                    contentVersion: accepted?.key.contentVersion ?? 0,
+                    renderPublicationVersion: accepted?.key.renderPublicationVersion ?? 0,
+                    effectiveWidth: pending.effectiveWidth,
+                    height: height
+                )
+                _ = geometryState.accept(size, intentGeneration: payload.intentGeneration)
+                if nativeItem.heightAuthority == .versionedRender {
+                    renderMeasurementHosts.removeValue(forKey: item.id)?.removeFromSuperview()
+                }
+            }
+            launchReadyTransaction()
+        }
+
+        private func renderMeasurementHost(for itemID: String) -> NSHostingView<AnyView> {
+            if let host = renderMeasurementHosts[itemID] { return host }
+            let host = NSHostingView(rootView: AnyView(EmptyView()))
+            host.alphaValue = 0
+            host.frame = NSRect(x: -100_000, y: -100_000, width: 1, height: 1)
+            scrollView?.contentView.addSubview(host)
+            renderMeasurementHosts[itemID] = host
+            return host
+        }
+
+        private func acceptedRenderHeight(
+            for item: TranscriptGeometryItem,
+            width: CGFloat,
+            sessionID: String?
+        ) -> NativeTranscriptRenderHeightValue? {
+            guard let accepted = acceptedRenderHeights[item.id],
+                  accepted.provenance == NativeTranscriptRenderHeightProvenance(
+                    itemID: item.id,
+                    contentRevision: item.contentRevision,
+                    outerEffectiveWidth: width,
+                    sessionID: sessionID
+                  )
+            else { return nil }
+            return accepted.value
+        }
+
+        private func rowContent(
+            at index: Int,
+            items: [NativeTranscriptItem],
+            rowBuilder: (Int) -> AnyView,
+            width: CGFloat,
+            sessionID: String?
+        ) -> AnyView {
             let context: NativeTranscriptRowRenderContext?
             if items.indices.contains(index) {
                 let item = items[index]
-                context = NativeTranscriptRowRenderContext(
+                let provenance = NativeTranscriptRenderHeightProvenance(
                     itemID: item.id,
                     contentRevision: item.contentRevision,
+                    outerEffectiveWidth: width,
+                    sessionID: sessionID
+                )
+                context = NativeTranscriptRowRenderContext(
+                    provenance: provenance,
                     publishAction: { [weak self] value in
                         self?.acceptRenderHeight(
                             value,
-                            itemID: item.id,
-                            contentRevision: item.contentRevision
+                            provenance: provenance
                         )
                     }
                 )
@@ -465,146 +809,202 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             )
         }
 
-        private func acceptRenderHeight(
+        @discardableResult
+        public func acceptRenderHeight(
             _ value: NativeTranscriptRenderHeightValue,
-            itemID: String,
-            contentRevision: Int
-        ) {
-            guard let item = items.first(where: { $0.id == itemID }),
+            provenance: NativeTranscriptRenderHeightProvenance
+        ) -> Bool {
+            guard let item = desiredItems.first(where: { $0.id == provenance.itemID }),
+                  item.heightAuthority == .versionedRender,
+                  provenance == NativeTranscriptRenderHeightProvenance(
+                    itemID: item.id,
+                    contentRevision: item.contentRevision,
+                    outerEffectiveWidth: availableWidth,
+                    sessionID: desiredSessionID
+                  ),
                   value.isAcceptable(
-                    capturedContentRevision: contentRevision,
+                    capturedContentRevision: provenance.contentRevision,
                     currentContentRevision: item.contentRevision,
-                    previous: renderHeights[itemID].flatMap { accepted in
-                        accepted.contentRevision == item.contentRevision
+                    previous: acceptedRenderHeights[item.id].flatMap { accepted in
+                        accepted.provenance == provenance
                             ? accepted.value
                             : nil
                     },
-                    effectiveWidth: availableWidth
+                    effectiveWidth: value.key.effectiveWidth
                   )
-            else { return }
-            renderHeights[itemID] = AcceptedRenderHeight(
-                contentRevision: contentRevision,
+            else { return false }
+            acceptedRenderHeights[item.id] = AcceptedRenderHeight(
+                provenance: provenance,
                 value: value
             )
-            heightCache.remove(id: itemID)
-            collectionView?.collectionViewLayout?.invalidateLayout()
+            stageDesiredGeometry()
+            return true
         }
 
-        private func scheduleLayout(preserveAnchor: Bool) {
-            pendingLayoutTask?.cancel()
-            let revision = semanticRevision
-            pendingLayoutTask = Task { @MainActor [weak self] in
-                await Task.yield()
-                guard let self, !Task.isCancelled else { return }
-                let timestamp = ProcessInfo.processInfo.systemUptime
-                let frame = UInt64((timestamp * 60).rounded(.down))
-                guard self.layoutGate.requestCommit(
-                    frame: frame,
-                    semanticRevision: revision,
-                    timestamp: timestamp
-                ) else {
-                    try? await Task.sleep(for: .milliseconds(17))
-                    guard !Task.isCancelled else { return }
-                    self.scheduleLayout(preserveAnchor: preserveAnchor)
-                    return
-                }
-                self.commitLayout(preserveAnchor: preserveAnchor)
+        private func launchReadyTransaction() {
+            guard let transaction = geometryState.beginIfReady(),
+                  let payload = pendingPayload,
+                  payload.intentGeneration == transaction.intentGeneration
+            else { return }
+            pendingPayload = nil
+            inFlightPayload = payload
+            geometryDrivers.mutate { [weak self] in
+                self?.performMutation(transaction, payload: payload)
             }
         }
 
-        private func commitLayout(preserveAnchor: Bool) {
-            guard let collectionView, scrollView != nil else { return }
-            let anchor = preserveAnchor ? viewportAnchor() : nil
-            let updatePlan = requiresFullReload
-                ? TranscriptCollectionUpdatePlan.reloadAll
-                : TranscriptCollectionUpdatePlan.between(
-                    previous: items,
-                    current: pendingItems
-                )
-            requiresFullReload = false
-            let shouldFollow = pendingFollowTail
-            pendingFollowTail = false
-            items = pendingItems
-            rowBuilder = pendingRowBuilder
-            if updatePlan.reloadsAllItems {
-                collectionView.reloadData()
-                scheduleLayoutCompletion(anchor: anchor, shouldFollow: shouldFollow)
-            } else if updatePlan.hasChanges {
-                let changedPaths = Set(updatePlan.changedIndexes.map {
-                    IndexPath(item: $0, section: 0)
-                })
-                let insertedPaths = Set(updatePlan.insertedIndexes.map {
-                    IndexPath(item: $0, section: 0)
-                })
-                let deletedPaths = Set(updatePlan.deletedIndexes.map {
-                    IndexPath(item: $0, section: 0)
-                })
-                NSAnimationContext.runAnimationGroup { context in
-                    context.duration = updatePlan.animatesChanges ? 0.16 : 0
-                    collectionView.collectionViewLayout?.invalidateLayout()
-                    collectionView.performBatchUpdates {
-                        if !deletedPaths.isEmpty {
-                            collectionView.deleteItems(at: deletedPaths)
-                        }
-                        if !insertedPaths.isEmpty {
-                            collectionView.insertItems(at: insertedPaths)
-                        }
-                        if !changedPaths.isEmpty {
-                            collectionView.reloadItems(at: changedPaths)
-                        }
-                    } completionHandler: { [weak self] _ in
-                        self?.scheduleLayoutCompletion(
-                            anchor: anchor,
-                            shouldFollow: shouldFollow
-                        )
-                    }
-                }
-            } else {
-                scheduleLayoutCompletion(anchor: anchor, shouldFollow: shouldFollow)
-            }
-        }
-
-        private func scheduleLayoutCompletion(
-            anchor: ViewportAnchor?,
-            shouldFollow: Bool
+        private func performMutation(
+            _ transaction: TranscriptGeometryTransaction,
+            payload: Payload
         ) {
-            Task { @MainActor [weak self] in
-                await Task.yield()
-                self?.completeLayout(anchor: anchor, shouldFollow: shouldFollow)
+            guard geometryState.inFlight?.generation == transaction.generation,
+                  inFlightPayload?.intentGeneration == payload.intentGeneration,
+                  let collectionView,
+                  let scrollView
+            else { return }
+            geometryMutationCount += 1
+            committedItems = payload.items
+            committedRowBuilder = payload.rowBuilder
+            committedBottomInset = transaction.target.bottomInset
+            committedSessionID = payload.sessionID
+            scrollView.contentInsets.bottom = committedBottomInset
+            let sectionInset = (collectionView.collectionViewLayout as? NSCollectionViewFlowLayout)?
+                .sectionInset ?? .init()
+            let horizontalSectionInset = sectionInset.left + sectionInset.right
+            let widthTransition = NativeTranscriptCollectionWidthTransition(
+                currentFrameWidth: collectionView.frame.width,
+                previousItemWidth: appliedGeometryTarget.effectiveWidth,
+                targetItemWidth: transaction.target.effectiveWidth,
+                horizontalSectionInset: horizontalSectionInset,
+                minimumClearance: flowLayoutClearance
+            )
+            assert(widthTransition.preservesFlowLayoutWidthInvariant(
+                horizontalSectionInset: horizontalSectionInset
+            ))
+            collectionView.setFrameSize(NSSize(
+                width: widthTransition.stagedFrameWidth,
+                height: max(collectionView.frame.height, scrollView.documentVisibleRect.height)
+            ))
+            appliedGeometryTarget = transaction.target.committedValue
+            // Replace cached old-width layout attributes while both old and new
+            // item widths fit the staged frame. Shrinking the frame before this
+            // pass lets FlowLayout validate stale attributes against the target frame.
+            collectionView.collectionViewLayout?.invalidateLayout()
+            collectionView.layoutSubtreeIfNeeded()
+            collectionView.setFrameSize(NSSize(
+                width: widthTransition.settledFrameWidth,
+                height: max(collectionView.frame.height, scrollView.documentVisibleRect.height)
+            ))
+
+            let hasStructuralChanges = !transaction.mutationPlan.insertedIDs.isEmpty
+                || !transaction.mutationPlan.deletedIDs.isEmpty
+            if !transaction.mutationPlan.reloadsAllItems, !hasStructuralChanges {
+                let reconfiguresAll = transaction.previousTarget.effectiveWidth
+                    != transaction.target.effectiveWidth
+                reconfigureVisibleItems(
+                    changedIDs: reconfiguresAll
+                        ? Set(committedItems.map(\.id))
+                        : transaction.mutationPlan.changedIDs
+                )
+            }
+            collectionView.collectionViewLayout?.invalidateLayout()
+
+            if transaction.mutationPlan.reloadsAllItems {
+                collectionView.reloadData()
+                collectionView.layoutSubtreeIfNeeded()
+                finishAppKitMutation(generation: transaction.generation)
+                return
+            }
+
+            let previousIDs = transaction.previousItems.map(\.id)
+            let currentIDs = transaction.target.items.map(\.id)
+            let insertedPaths = Set(transaction.mutationPlan.insertedIDs.compactMap { id in
+                currentIDs.firstIndex(of: id).map { IndexPath(item: $0, section: 0) }
+            })
+            let deletedPaths = Set(transaction.mutationPlan.deletedIDs.compactMap { id in
+                previousIDs.firstIndex(of: id).map { IndexPath(item: $0, section: 0) }
+            })
+            guard !insertedPaths.isEmpty || !deletedPaths.isEmpty else {
+                collectionView.layoutSubtreeIfNeeded()
+                finishAppKitMutation(generation: transaction.generation)
+                return
+            }
+            collectionView.performBatchUpdates {
+                if !deletedPaths.isEmpty { collectionView.deleteItems(at: deletedPaths) }
+                if !insertedPaths.isEmpty { collectionView.insertItems(at: insertedPaths) }
+            } completionHandler: { [weak self] _ in
+                self?.finishAppKitMutation(generation: transaction.generation)
             }
         }
 
-        private func completeLayout(anchor: ViewportAnchor?, shouldFollow: Bool) {
-            if let anchor, !shouldFollow {
-                restore(anchor: anchor)
-            } else if shouldFollow || scrollController.followsOutput {
-                scrollToBottom()
+        private func reconfigureVisibleItems(changedIDs: Set<String>) {
+            guard let collectionView, !changedIDs.isEmpty else { return }
+            for item in collectionView.visibleItems() {
+                guard let hostingItem = item as? TranscriptHostingItem,
+                      let indexPath = collectionView.indexPath(for: item),
+                      committedItems.indices.contains(indexPath.item),
+                      changedIDs.contains(committedItems[indexPath.item].id)
+                else { continue }
+                hostingItem.apply(rowContent(
+                    at: indexPath.item,
+                    items: committedItems,
+                    rowBuilder: committedRowBuilder,
+                    width: committedEffectiveWidth,
+                    sessionID: committedSessionID
+                ))
+            }
+        }
+
+        private func finishAppKitMutation(generation: Int) {
+            geometryDrivers.complete { [weak self] in
+                self?.completeMutation(generation: generation)
+            }
+        }
+
+        private func completeMutation(generation: Int) {
+            guard geometryState.inFlight?.generation == generation else { return }
+            let completion = geometryState.complete(
+                transactionGeneration: generation,
+                currentUserIntentRevision: userIntentRevision
+            )
+            guard completion.accepted else { return }
+            geometryCompletionCount += 1
+            inFlightPayload = nil
+            if let effect = completion.viewportEffect {
+                switch effect {
+                case .followTail where scrollController.followsOutput:
+                    scrollToBottom()
+                case let .preserve(anchor) where !scrollController.followsOutput:
+                    restore(anchor: anchor)
+                default:
+                    break
+                }
             }
             reportPosition(force: false)
+            if geometryState.pending?.isReady == true {
+                launchReadyTransaction()
+            } else if geometryState.pending != nil {
+                schedulePreparation()
+            }
         }
 
-        private struct ViewportAnchor {
-            let id: String
-            let offset: CGFloat
-        }
-
-        private func viewportAnchor() -> ViewportAnchor? {
+        private func viewportAnchor() -> TranscriptGeometryAnchor? {
             guard let collectionView, let scrollView else { return nil }
             let visible = collectionView.indexPathsForVisibleItems()
                 .sorted { $0.item < $1.item }
             guard let indexPath = visible.first,
-                  items.indices.contains(indexPath.item),
+                  committedItems.indices.contains(indexPath.item),
                   let attributes = collectionView.layoutAttributesForItem(at: indexPath)
             else { return nil }
-            return ViewportAnchor(
-                id: items[indexPath.item].id,
+            return TranscriptGeometryAnchor(
+                itemID: committedItems[indexPath.item].id,
                 offset: attributes.frame.minY - scrollView.documentVisibleRect.minY
             )
         }
 
-        private func restore(anchor: ViewportAnchor) {
+        private func restore(anchor: TranscriptGeometryAnchor) {
             guard let collectionView, let scrollView,
-                  let index = items.firstIndex(where: { $0.id == anchor.id }),
+                  let index = committedItems.firstIndex(where: { $0.id == anchor.itemID }),
                   let attributes = collectionView.layoutAttributesForItem(
                     at: IndexPath(item: index, section: 0)
                   )
@@ -624,18 +1024,35 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             reportPosition(force: true)
         }
 
+        private func viewportWidthDidChange(_ width: CGFloat) {
+            guard width > 1 else { return }
+            stageDesiredGeometry()
+            finalWidthLayoutTask?.cancel()
+            finalWidthLayoutTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(80))
+                guard let self, !Task.isCancelled else { return }
+                self.stageDesiredGeometry()
+            }
+        }
+
         @objc private func clipViewBoundsDidChange() {
             if let width = scrollView?.contentSize.width,
-               lastViewportWidth.map({ abs($0 - width) >= 0.5 }) ?? true {
+               lastViewportWidth.map({ abs($0 - width) >= 0.5 }) ?? true
+            {
                 lastViewportWidth = width
                 viewportWidthDidChange(width)
             }
-            guard isLiveScrolling || Self.currentEventIsUserNavigation else { return }
+            let isUserNavigation = Self.currentEventIsUserNavigation
+            guard isLiveScrolling || isUserNavigation else { return }
+            if !isLiveScrolling, isUserNavigation {
+                userIntentRevision &+= 1
+            }
             reportPosition(force: false)
         }
 
         @objc private func liveScrollWillStart() {
             isLiveScrolling = true
+            userIntentRevision &+= 1
         }
 
         @objc private func liveScrollDidEnd() {
@@ -645,10 +1062,9 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
 
         private func reportPosition(force: Bool) {
             guard let scrollView else { return }
-            let distance = scrollGeometry.distanceFromTail(
+            let nearBottom = scrollGeometry.distanceFromTail(
                 originY: scrollView.documentVisibleRect.origin.y
-            )
-            let nearBottom = distance <= 72
+            ) <= 72
             guard force || nearBottom != lastReportedNearBottom else { return }
             lastReportedNearBottom = nearBottom
             scrollController.viewportDidChange(isNearBottom: nearBottom)
@@ -658,8 +1074,13 @@ public struct NativeTranscriptCollectionView: NSViewRepresentable {
             TranscriptScrollGeometry(
                 documentHeight: scrollView?.documentView?.bounds.height ?? 0,
                 viewportHeight: scrollView?.documentVisibleRect.height ?? 0,
-                bottomObstructionHeight: bottomInset
+                bottomObstructionHeight: committedBottomInset
             )
+        }
+
+        private func removeRenderMeasurementHosts() {
+            for host in renderMeasurementHosts.values { host.removeFromSuperview() }
+            renderMeasurementHosts.removeAll(keepingCapacity: true)
         }
 
         private static var currentEventIsUserNavigation: Bool {

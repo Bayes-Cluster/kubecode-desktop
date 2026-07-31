@@ -2967,6 +2967,12 @@ struct TranscriptRenderingTests {
             in: controller.view
         ))
         scrollView = try #require(collectionView.enclosingScrollView)
+        #expect(distanceFromBottom(of: scrollView) <= 1)
+        let persistentActiveView = try #require(descendants(
+            of: NativeAgentMarkdownTextView.self,
+            in: collectionView
+        ).first { $0.string.contains("Concurrent streamed output line.") })
+        let persistentActiveStorage = try #require(persistentActiveView.textStorage)
         let markdownFrames = descendants(
             of: NativeAgentMarkdownTextView.self,
             in: controller.view
@@ -2994,7 +3000,13 @@ struct TranscriptRenderingTests {
             in: controller.view
         ))
         scrollView = try #require(collectionView.enclosingScrollView)
-        #expect(distanceFromBottom(of: scrollView) <= 80)
+        #expect(distanceFromBottom(of: scrollView) <= 1)
+        let grownActiveView = try #require(descendants(
+            of: NativeAgentMarkdownTextView.self,
+            in: collectionView
+        ).first { $0.string.contains("Growing streamed output line.") })
+        #expect(grownActiveView === persistentActiveView)
+        #expect(grownActiveView.textStorage === persistentActiveStorage)
         let documentHeight = try #require(scrollView.documentView?.bounds.height)
         #expect(documentHeight > scrollView.documentVisibleRect.height + 200)
         let streamedMarkdownHeight = descendants(
@@ -3029,7 +3041,7 @@ struct TranscriptRenderingTests {
             in: controller.view
         ))
         scrollView = try #require(collectionView.enclosingScrollView)
-        #expect(abs(scrollView.documentVisibleRect.origin.y - userPosition) < 4)
+        #expect(abs(scrollView.documentVisibleRect.origin.y - userPosition) <= 1)
         #expect(distanceFromBottom(of: scrollView) > 150)
 
         NotificationCenter.default.post(
@@ -3054,7 +3066,7 @@ struct TranscriptRenderingTests {
             of: NativeTranscriptCollectionNSView.self,
             in: controller.view
         )?.enclosingScrollView)
-        #expect(distanceFromBottom(of: scrollView) <= 48)
+        #expect(distanceFromBottom(of: scrollView) <= 1)
 
         model.runs = [try decode(AgentRun.self, from: """
         {
@@ -3103,10 +3115,25 @@ struct TranscriptRenderingTests {
         for pair in zip(itemFrames, itemFrames.dropFirst()) {
             #expect(pair.0.maxY <= pair.1.minY + 1)
         }
+        let visibleMarkdown = descendants(
+            of: NativeAgentMarkdownTextView.self,
+            in: collectionView
+        )
+        #expect(!visibleMarkdown.isEmpty)
+        for textView in visibleMarkdown {
+            let textFrame = textView.convert(textView.bounds, to: collectionView)
+            let itemFrame = try #require(itemFrames.first { $0.intersects(textFrame) })
+            let glyphFrame = renderedGlyphFrame(of: textView, in: collectionView)
+            #expect(glyphFrame.minY >= itemFrame.minY - 1)
+            #expect(glyphFrame.maxY <= itemFrame.maxY + 1)
+        }
         let visibleContentBottom = scrollView.documentVisibleRect.maxY
             - scrollView.contentInsets.bottom
         #expect(try #require(itemFrames.last).maxY <= visibleContentBottom + 1)
-        #expect(distanceFromBottom(of: scrollView) <= 48)
+        #expect(visibleMarkdown.map {
+            renderedGlyphFrame(of: $0, in: collectionView).maxY
+        }.max() ?? 0 <= visibleContentBottom + 1)
+        #expect(distanceFromBottom(of: scrollView) <= 1)
     }
 
     @Test func run_stream_reconnect_resumes_after_the_last_sequence_and_is_bounded() {
@@ -3256,6 +3283,21 @@ struct TranscriptRenderingTests {
             bottomObstructionHeight: scrollView.contentInsets.bottom
         )
         return geometry.distanceFromTail(originY: scrollView.documentVisibleRect.origin.y)
+    }
+
+    private func renderedGlyphFrame(
+        of textView: NativeAgentMarkdownTextView,
+        in ancestor: NSView
+    ) -> NSRect {
+        guard let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer
+        else { return .zero }
+        layoutManager.ensureLayout(for: textContainer)
+        let used = layoutManager.usedRect(for: textContainer).offsetBy(
+            dx: textView.textContainerInset.width,
+            dy: textView.textContainerInset.height
+        )
+        return textView.convert(used, to: ancestor)
     }
 
     private func contrastingPixelCount(

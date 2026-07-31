@@ -40,6 +40,28 @@ enum UserMessageBubbleMetrics {
     }
 }
 
+enum TranscriptSurfaceHeightAuthority {
+    enum Presentation {
+        case transcriptItem
+        case activityStep
+    }
+
+    static func resolve(
+        role: TranscriptRole,
+        presentation: Presentation,
+        isExpanded: Bool
+    ) -> NativeTranscriptHeightAuthority {
+        switch (presentation, role) {
+        case (.transcriptItem, .user), (_, .agent):
+            .versionedRender
+        case (_, .thinking) where isExpanded:
+            .versionedRender
+        default:
+            .synchronousHosting
+        }
+    }
+}
+
 private enum TranscriptSurfaceEntry: Identifiable, Hashable {
     case revisionWarning(String)
     case loadEarlier(isLoading: Bool)
@@ -97,6 +119,7 @@ private struct TranscriptViewport: View {
     let outputRevision: String
     let bottomInset: CGFloat
     let scrollController: TranscriptScrollController
+    let heightAuthority: (TranscriptSurfaceEntry) -> NativeTranscriptHeightAuthority
     let layoutRevision: (String) -> Int
     let rowBuilder: (TranscriptSurfaceEntry) -> AnyView
 
@@ -107,7 +130,8 @@ private struct TranscriptViewport: View {
                     id: entry.id,
                     contentRevision: entry.contentRevision,
                     layoutRevision: layoutRevision(entry.id),
-                    resizePolicy: entry.resizePolicy
+                    resizePolicy: entry.resizePolicy,
+                    heightAuthority: heightAuthority(entry)
                 )
             },
             sessionID: sessionID,
@@ -1584,6 +1608,7 @@ struct ContentView: View {
                     outputRevision: transcriptScrollMarker,
                     bottomInset: transcriptBottomClearance,
                     scrollController: sessionWorkspace.transcriptScrollController,
+                    heightAuthority: transcriptSurfaceHeightAuthority,
                     layoutRevision: { ownerID in
                         sessionWorkspace.transcriptLayoutRevision(
                             sessionID: model.selectedConversationID,
@@ -2213,6 +2238,41 @@ struct ContentView: View {
             )
         })
         return entries
+    }
+
+    private func transcriptSurfaceHeightAuthority(
+        _ entry: TranscriptSurfaceEntry
+    ) -> NativeTranscriptHeightAuthority {
+        switch entry {
+        case .runOutput:
+            return .versionedRender
+        case let .item(item):
+            let expanded = item.role == .thinking
+                && sessionWorkspace.resolvedTranscriptExpansion(
+                    sessionID: model.selectedConversationID,
+                    itemID: item.id,
+                    defaultExpanded: false
+                )
+            return TranscriptSurfaceHeightAuthority.resolve(
+                role: item.role,
+                presentation: .transcriptItem,
+                isExpanded: expanded
+            )
+        case let .activityStep(item, _, _):
+            let expanded = item.role == .thinking
+                && sessionWorkspace.resolvedTranscriptExpansion(
+                    sessionID: model.selectedConversationID,
+                    itemID: item.id,
+                    defaultExpanded: false
+                )
+            return TranscriptSurfaceHeightAuthority.resolve(
+                role: item.role,
+                presentation: .activityStep,
+                isExpanded: expanded
+            )
+        default:
+            return .synchronousHosting
+        }
     }
 
     private func transcriptTitle(_ item: TranscriptItem) -> String {
