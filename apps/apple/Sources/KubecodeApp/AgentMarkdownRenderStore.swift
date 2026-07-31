@@ -2,6 +2,47 @@ import AppKit
 import KubecodeMarkdown
 import Observation
 
+enum AgentMarkdownRenderSegment: String, Hashable, Sendable {
+    case standalone
+    case userMessage
+    case agentResponse
+    case thinking
+    case activityUpdate
+    case runOutput
+}
+
+struct AgentMarkdownRenderScope: Hashable, Sendable {
+    let projectIdentity: String?
+    let sessionID: String?
+}
+
+struct AgentMarkdownRenderIdentity: Hashable, Sendable {
+    let scope: AgentMarkdownRenderScope
+    let rowID: String
+    let semanticItemID: String
+    let segment: AgentMarkdownRenderSegment
+
+    init(
+        scope: AgentMarkdownRenderScope,
+        rowID: String,
+        semanticItemID: String? = nil,
+        segment: AgentMarkdownRenderSegment
+    ) {
+        self.scope = scope
+        self.rowID = rowID
+        self.semanticItemID = semanticItemID ?? rowID
+        self.segment = segment
+    }
+
+    static func legacy(rowID: String) -> Self {
+        Self(
+            scope: .init(projectIdentity: nil, sessionID: nil),
+            rowID: rowID,
+            segment: .standalone
+        )
+    }
+}
+
 @MainActor
 @Observable
 final class AgentMarkdownRenderStore {
@@ -24,6 +65,7 @@ final class AgentMarkdownRenderStore {
         var commit: AgentMarkdownRenderCommit?
         var inputs: AgentMarkdownRenderInputs?
         var heights: [AgentMarkdownRenderKey: AgentMarkdownRenderHeightCommit] = [:]
+        var heightOrder: [AgentMarkdownRenderKey] = []
         var styleIdentity: Int?
         var styleRevision = 0
         var resourceIdentity: String?
@@ -44,8 +86,13 @@ final class AgentMarkdownRenderStore {
     @ObservationIgnored private let documentScheduler: StreamingMarkdownSession.Scheduler
     @ObservationIgnored private let renderScheduler: AgentMarkdownRenderSession.RenderScheduler
     @ObservationIgnored private let attachmentResolver: AttachmentResolver
-    @ObservationIgnored private var rows: [String: Row] = [:]
+    @ObservationIgnored private let capacity: Int
+    @ObservationIgnored private let heightCapacityPerRow: Int
+    @ObservationIgnored private var rows: [AgentMarkdownRenderIdentity: Row] = [:]
+    @ObservationIgnored private var rowOrder: [AgentMarkdownRenderIdentity] = []
     @ObservationIgnored private var resourceGenerations: [String: Int] = [:]
+    @ObservationIgnored private var activeScope: AgentMarkdownRenderScope?
+    @ObservationIgnored private var measurementCount = 0
 
     private(set) var changeToken = 0
 
@@ -67,12 +114,16 @@ final class AgentMarkdownRenderStore {
                 return await resourceContext.data(for: path)
             }
             return nil
-        }
+        },
+        capacity: Int = 512,
+        heightCapacityPerRow: Int = 8
     ) {
         self.documentBuilder = documentBuilder
         self.documentScheduler = documentScheduler
         self.renderScheduler = renderScheduler
         self.attachmentResolver = attachmentResolver
+        self.capacity = max(1, capacity)
+        self.heightCapacityPerRow = max(1, heightCapacityPerRow)
     }
 
     @discardableResult
@@ -84,7 +135,26 @@ final class AgentMarkdownRenderStore {
         styleIdentity: Int = 0,
         resourceContext: MarkdownProjectResourceContext? = nil
     ) -> StreamingMarkdownSession.SubmissionResult {
-        let row = row(for: rowID)
+        submit(
+            identity: .legacy(rowID: rowID),
+            source: source,
+            typography: typography,
+            tone: tone,
+            styleIdentity: styleIdentity,
+            resourceContext: resourceContext
+        )
+    }
+
+    @discardableResult
+    func submit(
+        identity: AgentMarkdownRenderIdentity,
+        source: String,
+        typography: WorkspaceTypography,
+        tone: AgentMarkdownTone,
+        styleIdentity: Int = 0,
+        resourceContext: MarkdownProjectResourceContext? = nil
+    ) -> StreamingMarkdownSession.SubmissionResult {
+        let row = row(for: identity)
         activateStyle(row, identity: styleIdentity)
         activateResourceContext(row, context: resourceContext)
         activateSemanticRequest(
@@ -107,12 +177,28 @@ final class AgentMarkdownRenderStore {
     }
 
     func latestRenderCommit(rowID: String) -> AgentMarkdownRenderCommit? {
+        latestRenderCommit(identity: .legacy(rowID: rowID))
+    }
+
+    func latestRenderCommit(
+        identity: AgentMarkdownRenderIdentity
+    ) -> AgentMarkdownRenderCommit? {
         _ = changeToken
-        return rows[rowID]?.commit
+        guard let row = rows[identity] else { return nil }
+        touch(identity)
+        return row.commit
     }
 
     func latestRenderInputs(rowID: String) -> AgentMarkdownRenderInputs? {
-        rows[rowID]?.inputs
+        latestRenderInputs(identity: .legacy(rowID: rowID))
+    }
+
+    func latestRenderInputs(
+        identity: AgentMarkdownRenderIdentity
+    ) -> AgentMarkdownRenderInputs? {
+        guard let row = rows[identity] else { return nil }
+        touch(identity)
+        return row.inputs
     }
 
     func heightCommit(
@@ -120,12 +206,26 @@ final class AgentMarkdownRenderStore {
         width: CGFloat,
         verticalInset: CGFloat
     ) -> AgentMarkdownRenderHeightCommit? {
-        guard let row = rows[rowID],
+        heightCommit(
+            identity: .legacy(rowID: rowID),
+            width: width,
+            verticalInset: verticalInset
+        )
+    }
+
+    func heightCommit(
+        identity: AgentMarkdownRenderIdentity,
+        width: CGFloat,
+        verticalInset: CGFloat
+    ) -> AgentMarkdownRenderHeightCommit? {
+        guard let row = rows[identity],
               let renderCommit = row.commit,
               let inputs = row.inputs
         else { return nil }
+        touch(identity)
         let key = AgentMarkdownRenderKey(inputs: inputs, effectiveWidth: width)
         if let cached = row.heights[key], cached.renderCommit === renderCommit {
+            touchHeight(key, in: row)
             return cached
         }
         let measured = AgentMarkdownRenderHeightCommit.measure(
@@ -134,7 +234,12 @@ final class AgentMarkdownRenderStore {
             verticalInset: verticalInset
         )
         guard row.commit === renderCommit, row.inputs == inputs else { return nil }
+        measurementCount &+= 1
         row.heights[key] = measured
+        touchHeight(key, in: row)
+        while row.heightOrder.count > heightCapacityPerRow {
+            row.heights.removeValue(forKey: row.heightOrder.removeFirst())
+        }
         return measured
     }
 
@@ -145,8 +250,23 @@ final class AgentMarkdownRenderStore {
         images: [String: NSImage],
         expectedAttachmentRequestEpoch: Int
     ) -> Bool {
+        settleAttachments(
+            identity: .legacy(rowID: rowID),
+            expectedRenderPublicationVersion: expectedRenderPublicationVersion,
+            images: images,
+            expectedAttachmentRequestEpoch: expectedAttachmentRequestEpoch
+        )
+    }
+
+    @discardableResult
+    func settleAttachments(
+        identity: AgentMarkdownRenderIdentity,
+        expectedRenderPublicationVersion: Int,
+        images: [String: NSImage],
+        expectedAttachmentRequestEpoch: Int
+    ) -> Bool {
         guard !images.isEmpty,
-              let row = rows[rowID],
+              let row = rows[identity],
               let base = row.commit,
               let inputs = row.inputs,
               inputs.renderPublicationVersion == expectedRenderPublicationVersion,
@@ -178,6 +298,7 @@ final class AgentMarkdownRenderStore {
             attachmentResolutionGeneration: row.attachmentResolutionGeneration
         )
         row.heights.removeAll(keepingCapacity: true)
+        row.heightOrder.removeAll(keepingCapacity: true)
         row.settlingPublicationVersion = nil
         changeToken &+= 1
         return true
@@ -228,13 +349,37 @@ final class AgentMarkdownRenderStore {
     }
 
     func removeAll() {
-        for row in rows.values {
-            row.attachmentTask?.cancel()
-            row.session.cancel()
-        }
-        rows.removeAll(keepingCapacity: false)
+        removeAllRows()
         resourceGenerations.removeAll(keepingCapacity: false)
+        activeScope = nil
+    }
+
+    func reconcile(
+        scope: AgentMarkdownRenderScope,
+        retainingRowIDs: Set<String>
+    ) {
+        if activeScope != scope {
+            removeAllRows()
+            resourceGenerations.removeAll(keepingCapacity: false)
+            activeScope = scope
+        }
+        let removed = rows.keys.filter {
+            $0.scope == scope && !retainingRowIDs.contains($0.rowID)
+        }
+        for identity in removed { remove(identity: identity) }
+    }
+
+    func remove(identity: AgentMarkdownRenderIdentity) {
+        guard let row = rows.removeValue(forKey: identity) else { return }
+        cancel(row)
+        rowOrder.removeAll { $0 == identity }
         changeToken &+= 1
+    }
+
+    func remove(scope: AgentMarkdownRenderScope) {
+        let removed = rows.keys.filter { $0.scope == scope }
+        for identity in removed { remove(identity: identity) }
+        if activeScope == scope { activeScope = nil }
     }
 
     func assertMainActorIsolation() {
@@ -242,21 +387,43 @@ final class AgentMarkdownRenderStore {
     }
 
 #if DEBUG
-    var testingRowIDs: Set<String> { Set(rows.keys) }
+    var testingRowIDs: Set<String> { Set(rows.keys.map(\.rowID)) }
+    var testingIdentities: Set<AgentMarkdownRenderIdentity> { Set(rows.keys) }
+    var testingMeasurementCount: Int { measurementCount }
+
+    func testingSession(
+        identity: AgentMarkdownRenderIdentity
+    ) -> AgentMarkdownRenderSession? {
+        rows[identity]?.session
+    }
+
+    func testingHeightKeys(
+        identity: AgentMarkdownRenderIdentity
+    ) -> [AgentMarkdownRenderKey] {
+        rows[identity]?.heightOrder ?? []
+    }
 #endif
 
-    private func row(for rowID: String) -> Row {
-        if let row = rows[rowID] { return row }
+    private func row(for identity: AgentMarkdownRenderIdentity) -> Row {
+        activate(scope: identity.scope)
+        if let row = rows[identity] {
+            touch(identity)
+            return row
+        }
+        while rows.count >= capacity, let oldest = rowOrder.first {
+            remove(identity: oldest)
+        }
         let row = Row()
         row.session = AgentMarkdownRenderSession(
             documentBuilder: documentBuilder,
             documentScheduler: documentScheduler,
             renderScheduler: renderScheduler,
             onCommit: { [weak self] commit in
-                self?.accept(commit, rowID: rowID)
+                self?.accept(commit, identity: identity)
             }
         )
-        rows[rowID] = row
+        rows[identity] = row
+        touch(identity)
         return row
     }
 
@@ -285,8 +452,11 @@ final class AgentMarkdownRenderStore {
         row.resourceContext = context
     }
 
-    private func accept(_ commit: AgentMarkdownRenderCommit, rowID: String) {
-        guard let row = rows[rowID],
+    private func accept(
+        _ commit: AgentMarkdownRenderCommit,
+        identity: AgentMarkdownRenderIdentity
+    ) {
+        guard let row = rows[identity],
               row.session.latestCommit === commit,
               row.semanticRequest == SemanticRequest(
                 source: commit.source,
@@ -317,12 +487,13 @@ final class AgentMarkdownRenderStore {
             attachmentResolutionGeneration: 0
         )
         row.heights.removeAll(keepingCapacity: true)
+        row.heightOrder.removeAll(keepingCapacity: true)
         changeToken &+= 1
-        resolveAttachmentsIfNeeded(rowID: rowID, row: row, commit: acceptedCommit)
+        resolveAttachmentsIfNeeded(identity: identity, row: row, commit: acceptedCommit)
     }
 
     private func resolveAttachmentsIfNeeded(
-        rowID: String,
+        identity: AgentMarkdownRenderIdentity,
         row: Row,
         commit: AgentMarkdownRenderCommit
     ) {
@@ -350,7 +521,7 @@ final class AgentMarkdownRenderStore {
                 return results
             }
             guard !Task.isCancelled,
-                  let current = self.rows[rowID],
+                  let current = self.rows[identity],
                   current.commit === commit,
                   current.renderPublicationVersion == expectedPublication,
                   current.resourceIdentity == expectedResourceIdentity,
@@ -364,7 +535,7 @@ final class AgentMarkdownRenderStore {
                 }
             }
             if !self.settleAttachments(
-                rowID: rowID,
+                identity: identity,
                 expectedRenderPublicationVersion: expectedPublication,
                 images: images,
                 expectedAttachmentRequestEpoch: expectedAttachmentRequestEpoch
@@ -373,6 +544,41 @@ final class AgentMarkdownRenderStore {
             }
             current.attachmentTask = nil
         }
+    }
+
+    private func activate(scope: AgentMarkdownRenderScope) {
+        guard activeScope != scope else { return }
+        removeAllRows()
+        resourceGenerations.removeAll(keepingCapacity: false)
+        activeScope = scope
+    }
+
+    private func touch(_ identity: AgentMarkdownRenderIdentity) {
+        rowOrder.removeAll { $0 == identity }
+        rowOrder.append(identity)
+    }
+
+    private func touchHeight(_ key: AgentMarkdownRenderKey, in row: Row) {
+        row.heightOrder.removeAll { $0 == key }
+        row.heightOrder.append(key)
+    }
+
+    private func cancel(_ row: Row) {
+        row.attachmentRequestEpoch &+= 1
+        row.attachmentTask?.cancel()
+        row.attachmentTask = nil
+        row.session.cancel()
+    }
+
+    private func removeAllRows() {
+        guard !rows.isEmpty else {
+            rowOrder.removeAll(keepingCapacity: false)
+            return
+        }
+        for row in rows.values { cancel(row) }
+        rows.removeAll(keepingCapacity: false)
+        rowOrder.removeAll(keepingCapacity: false)
+        changeToken &+= 1
     }
 
     private func activateSemanticRequest(

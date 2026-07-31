@@ -749,6 +749,11 @@ struct TranscriptGeometryTransactionTests {
         let store = AgentMarkdownRenderStore(attachmentResolver: { _, _ in
             await resolver.resolve()
         })
+        let renderIdentity = AgentMarkdownRenderIdentity(
+            scope: .init(projectIdentity: nil, sessionID: "mounted-attachment"),
+            rowID: "markdown",
+            segment: .standalone
+        )
         let source = "Before image\n\n![pixel](asset.png)\n\nAfter image"
         let controller = NSHostingController(rootView: markdownTranscriptView(
             source: source,
@@ -789,7 +794,7 @@ struct TranscriptGeometryTransactionTests {
             window: window,
             controller: controller
         )
-        #expect(store.latestRenderInputs(rowID: "markdown")?.renderPublicationVersion == 1)
+        #expect(store.latestRenderInputs(identity: renderIdentity)?.renderPublicationVersion == 1)
         #expect(driver.mutations.count == 1)
         driver.releaseMutation()
         layout(window: window, controller: controller)
@@ -877,16 +882,16 @@ struct TranscriptGeometryTransactionTests {
         #expect(driver.completions.count == 1)
         let activeMutationCount = coordinator.geometryMutationCount
         let initialGeneration = try #require(coordinator.inFlightGeometryGeneration)
-        let unresolved = try #require(store.latestRenderInputs(rowID: "markdown"))
+        let unresolved = try #require(store.latestRenderInputs(identity: renderIdentity))
         #expect(await resolver.callCount == 1)
 
         await resolver.release(0)
         await resolver.waitForCompletion(0)
         try await waitForGeometry("attachment settlement") {
             layout(window: window, controller: controller)
-            return store.latestRenderInputs(rowID: "markdown")?.attachmentResolutionGeneration == 1
+            return store.latestRenderInputs(identity: renderIdentity)?.attachmentResolutionGeneration == 1
         }
-        #expect(store.latestRenderInputs(rowID: "markdown")?.attachmentResolutionGeneration == 1)
+        #expect(store.latestRenderInputs(identity: renderIdentity)?.attachmentResolutionGeneration == 1)
         try await drivePreparationsWhileInFlight(
             driver: driver,
             window: window,
@@ -901,7 +906,7 @@ struct TranscriptGeometryTransactionTests {
             completions: coordinator.geometryCompletionCount
         )
         let staleSettlement = store.settleAttachments(
-            rowID: "markdown",
+            identity: renderIdentity,
             expectedRenderPublicationVersion: unresolved.renderPublicationVersion,
             images: ["asset.png": NSImage(size: NSSize(width: 32, height: 16))],
             expectedAttachmentRequestEpoch: -1
@@ -941,11 +946,11 @@ struct TranscriptGeometryTransactionTests {
             ) <= 1)
         }
 
-        let settled = try #require(store.latestRenderInputs(rowID: "markdown"))
+        let settled = try #require(store.latestRenderInputs(identity: renderIdentity))
         let settledMutationCount = coordinator.geometryMutationCount
         let settledCompletionCount = coordinator.geometryCompletionCount
         let duplicate = store.submit(
-            rowID: "markdown",
+            identity: renderIdentity,
             source: source,
             typography: WorkspaceTypography(fontName: "System", pointSize: 14),
             tone: .primary

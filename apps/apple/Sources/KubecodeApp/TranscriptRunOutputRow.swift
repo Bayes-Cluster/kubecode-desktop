@@ -23,7 +23,9 @@ struct TranscriptRunOutputRow: View {
     var body: some View {
         AgentMarkdownView(
             source: output.text,
-            copyResponseSource: output.text
+            copyResponseSource: output.text,
+            renderItemID: output.id,
+            renderSegment: .runOutput
         )
         .frame(maxWidth: 760, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)

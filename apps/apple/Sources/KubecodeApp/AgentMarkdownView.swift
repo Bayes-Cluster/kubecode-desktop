@@ -16,6 +16,8 @@ struct AgentMarkdownView: View {
     private let tone: AgentMarkdownTone
     private let copyResponseSource: String?
     private let isStreaming: Bool
+    private let renderItemID: String?
+    private let renderSegment: AgentMarkdownRenderSegment
     @State private var localRenderStore = AgentMarkdownRenderStore()
     @State private var localRowID = UUID().uuidString
 
@@ -23,19 +25,33 @@ struct AgentMarkdownView: View {
         source: String,
         tone: AgentMarkdownTone = .primary,
         copyResponseSource: String? = nil,
-        isStreaming: Bool = false
+        isStreaming: Bool = false,
+        renderItemID: String? = nil,
+        renderSegment: AgentMarkdownRenderSegment = .standalone
     ) {
         self.source = source
         self.tone = tone
         self.copyResponseSource = copyResponseSource
         self.isStreaming = isStreaming
+        self.renderItemID = renderItemID
+        self.renderSegment = renderSegment
     }
 
     var body: some View {
         let renderStore = sharedRenderStore ?? localRenderStore
         let rowID = rowRenderContext?.itemID ?? localRowID
-        let preparedCommit = renderStore.latestRenderCommit(rowID: rowID)
+        let identity = AgentMarkdownRenderIdentity(
+            scope: .init(
+                projectIdentity: resourceContext?.identity,
+                sessionID: rowRenderContext?.sessionID
+            ),
+            rowID: rowID,
+            semanticItemID: renderItemID,
+            segment: renderSegment
+        )
+        let preparedCommit = renderStore.latestRenderCommit(identity: identity)
         let input = AgentMarkdownRenderInput(
+            identity: identity,
             source: source,
             typography: typography,
             tone: tone,
@@ -52,7 +68,7 @@ struct AgentMarkdownView: View {
             resourceContext: resourceContext,
             preparedCommit: preparedCommit,
             renderStore: renderStore,
-            renderRowID: rowID,
+            renderIdentity: identity,
             onRenderHeight: { measured in
                 guard let rowRenderContext else { return }
                 let value = NativeTranscriptRenderHeightValue(
@@ -67,19 +83,18 @@ struct AgentMarkdownView: View {
             }
         )
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onAppear { submit(input, rowID: rowID, store: renderStore) }
+        .onAppear { submit(input, store: renderStore) }
         .onChange(of: input) { _, value in
-            submit(value, rowID: rowID, store: renderStore)
+            submit(value, store: renderStore)
         }
     }
 
     private func submit(
         _ input: AgentMarkdownRenderInput,
-        rowID: String,
         store: AgentMarkdownRenderStore
     ) {
         _ = store.submit(
-            rowID: rowID,
+            identity: input.identity,
             source: input.source,
             typography: input.typography,
             tone: input.tone,
@@ -90,6 +105,7 @@ struct AgentMarkdownView: View {
 }
 
 private struct AgentMarkdownRenderInput: Equatable {
+    let identity: AgentMarkdownRenderIdentity
     let source: String
     let typography: WorkspaceTypography
     let tone: AgentMarkdownTone
