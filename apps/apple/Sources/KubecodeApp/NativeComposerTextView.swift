@@ -35,6 +35,22 @@ enum ComposerPresentationMetrics {
         verticalInset + contentHeight + expandedRowSpacing + controlRowHeight + verticalInset
     }
 
+    static func effectiveEditorWidth(
+        totalWidth: CGFloat,
+        contextWidth: CGFloat,
+        trailingWidth: CGFloat
+    ) -> CGFloat {
+        max(
+            40,
+            totalWidth
+                - leadingInset
+                - trailingInset
+                - contextWidth
+                - trailingWidth
+                - (controlSpacing * 2)
+        )
+    }
+
     static func primaryActionIsProminent(
         hasActiveRun: Bool,
         hasSendableText: Bool
@@ -51,6 +67,62 @@ enum ComposerPresentationMetrics {
         stateRequested: Bool
     ) -> Bool {
         stateRequested || measuredHeight > ComposerHeightCalculator.minimumHeight + 0.5
+    }
+}
+
+struct ComposerMeasurementInput: Equatable {
+    let text: String
+    let width: CGFloat
+    let fontName: String
+    let fontSize: CGFloat
+}
+
+struct ComposerMeasurementRequest: Equatable {
+    let generation: Int
+    let input: ComposerMeasurementInput
+}
+
+struct ComposerMeasurementState {
+    private(set) var latestRequest: ComposerMeasurementRequest?
+    private(set) var committedInput: ComposerMeasurementInput?
+    private(set) var committedHeight: CGFloat?
+    private(set) var scheduledMeasurementCount = 0
+    private(set) var completedMeasurementCount = 0
+    private(set) var rejectedMeasurementCount = 0
+    private var nextGeneration = 0
+
+    mutating func request(_ input: ComposerMeasurementInput) -> ComposerMeasurementRequest? {
+        if let latestRequest {
+            guard latestRequest.input != input else { return nil }
+        } else if committedInput == input {
+            return nil
+        }
+
+        nextGeneration += 1
+        let request = ComposerMeasurementRequest(generation: nextGeneration, input: input)
+        latestRequest = request
+        scheduledMeasurementCount += 1
+        return request
+    }
+
+    mutating func shouldMeasure(_ request: ComposerMeasurementRequest) -> Bool {
+        guard latestRequest == request else {
+            rejectedMeasurementCount += 1
+            return false
+        }
+        return true
+    }
+
+    mutating func commit(_ request: ComposerMeasurementRequest, height: CGFloat) -> Bool {
+        guard latestRequest == request else {
+            rejectedMeasurementCount += 1
+            return false
+        }
+        latestRequest = nil
+        committedInput = request.input
+        committedHeight = height
+        completedMeasurementCount += 1
+        return true
     }
 }
 
@@ -153,11 +225,11 @@ struct NativeComposerLayout: Layout {
             + (ComposerPresentationMetrics.controlSpacing * CGFloat(controls.count))
             + 240
         let width = proposal.width ?? intrinsicWidth
-        let editorWidth = expanded
-            ? max(40, width
-                - ComposerPresentationMetrics.leadingInset
-                - ComposerPresentationMetrics.trailingInset)
-            : compactEditorWidth(totalWidth: width, controlSizes: controls)
+        let editorWidth = ComposerPresentationMetrics.effectiveEditorWidth(
+            totalWidth: width,
+            contextWidth: controls[0].width,
+            trailingWidth: controls[1].width
+        )
         let editor = subviews[1].sizeThatFits(ProposedViewSize(width: editorWidth, height: nil))
         let height = expanded
             ? ComposerPresentationMetrics.expandedBarHeight(contentHeight: editor.height)
@@ -174,18 +246,24 @@ struct NativeComposerLayout: Layout {
         guard subviews.count == 3 else { return }
         let contextSize = subviews[0].sizeThatFits(.unspecified)
         let trailingSize = subviews[2].sizeThatFits(.unspecified)
+        let editorWidth = ComposerPresentationMetrics.effectiveEditorWidth(
+            totalWidth: bounds.width,
+            contextWidth: contextSize.width,
+            trailingWidth: trailingSize.width
+        )
+        let editorX = bounds.minX
+            + ComposerPresentationMetrics.leadingInset
+            + contextSize.width
+            + ComposerPresentationMetrics.controlSpacing
 
         if expanded {
-            let editorWidth = max(40, bounds.width
-                - ComposerPresentationMetrics.leadingInset
-                - ComposerPresentationMetrics.trailingInset)
             let editorSize = subviews[1].sizeThatFits(ProposedViewSize(
                 width: editorWidth,
                 height: nil
             ))
             subviews[1].place(
                 at: CGPoint(
-                    x: bounds.minX + ComposerPresentationMetrics.leadingInset,
+                    x: editorX,
                     y: bounds.minY + ComposerPresentationMetrics.verticalInset
                 ),
                 anchor: .topLeading,
@@ -213,8 +291,6 @@ struct NativeComposerLayout: Layout {
             return
         }
 
-        let controls = [contextSize, trailingSize]
-        let editorWidth = compactEditorWidth(totalWidth: bounds.width, controlSizes: controls)
         var x = bounds.minX + ComposerPresentationMetrics.leadingInset
         subviews[0].place(
             at: CGPoint(x: x, y: bounds.midY),
@@ -232,17 +308,6 @@ struct NativeComposerLayout: Layout {
             at: CGPoint(x: x, y: bounds.midY),
             anchor: .leading,
             proposal: ProposedViewSize(trailingSize)
-        )
-    }
-
-    private func compactEditorWidth(totalWidth: CGFloat, controlSizes: [CGSize]) -> CGFloat {
-        max(
-            40,
-            totalWidth
-                - ComposerPresentationMetrics.leadingInset
-                - ComposerPresentationMetrics.trailingInset
-                - controlSizes.reduce(0) { $0 + $1.width }
-                - (ComposerPresentationMetrics.controlSpacing * CGFloat(controlSizes.count))
         )
     }
 }
@@ -296,6 +361,7 @@ struct NativeComposerTextView: NSViewRepresentable {
         scrollView.hasHorizontalScroller = false
         scrollView.hasVerticalScroller = false
         scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
         scrollView.documentView = textView
         scrollView.heightBinding = $height
         context.coordinator.textView = textView
@@ -417,16 +483,14 @@ struct NativeComposerTextView: NSViewRepresentable {
 
 final class ComposerScrollView: NSScrollView {
     var heightBinding: Binding<CGFloat>?
-    private var measurementScheduled = false
-    private var lastMeasurement: Measurement?
-    private(set) var completedMeasurementCount = 0
+    private var measurementState = ComposerMeasurementState()
 
-    private struct Measurement: Equatable {
-        let text: String
-        let width: CGFloat
-        let fontName: String
-        let fontSize: CGFloat
-        let height: CGFloat
+    var completedMeasurementCount: Int {
+        measurementState.completedMeasurementCount
+    }
+
+    var committedMeasurementInput: ComposerMeasurementInput? {
+        measurementState.committedInput
     }
 
     override func layout() {
@@ -445,55 +509,66 @@ final class ComposerScrollView: NSScrollView {
     }
 
     func scheduleMeasurement() {
-        guard !measurementScheduled else { return }
-        measurementScheduled = true
+        guard let input = measurementInput(),
+              let request = measurementState.request(input)
+        else { return }
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            defer { self.measurementScheduled = false }
-            self.measureText()
+            _ = self?.measure(request)
         }
     }
 
-    private func measureText() {
+    @discardableResult
+    func performPendingMeasurement() -> Bool {
+        guard let request = measurementState.latestRequest else { return false }
+        return measure(request)
+    }
+
+    private func measurementInput() -> ComposerMeasurementInput? {
         guard let textView = documentView as? NSTextView,
+              heightBinding != nil
+        else { return nil }
+        let width = bounds.width
+        guard width > 40 else { return nil }
+        let font = textView.font ?? .preferredFont(forTextStyle: .body)
+        return ComposerMeasurementInput(
+            text: textView.string,
+            width: width,
+            fontName: font.fontName,
+            fontSize: font.pointSize
+        )
+    }
+
+    private func measure(_ request: ComposerMeasurementRequest) -> Bool {
+        guard measurementState.shouldMeasure(request),
+              let textView = documentView as? NSTextView,
               let textContainer = textView.textContainer,
               let heightBinding
-        else { return }
-        let width = contentSize.width
-        guard width > 40 else { return }
-        let font = textView.font ?? .preferredFont(forTextStyle: .body)
-        if let lastMeasurement,
-           lastMeasurement.text == textView.string,
-           lastMeasurement.width == width,
-           lastMeasurement.fontName == font.fontName,
-           lastMeasurement.fontSize == font.pointSize {
-            apply(height: lastMeasurement.height, to: heightBinding)
-            return
+        else { return false }
+        guard measurementInput() == request.input else {
+            scheduleMeasurement()
+            return false
         }
-        completedMeasurementCount += 1
-        if abs(textView.frame.width - width) > 0.5 {
-            textView.setFrameSize(NSSize(width: width, height: textView.frame.height))
+
+        let input = request.input
+        if abs(textView.frame.width - input.width) > 0.5 {
+            textView.setFrameSize(NSSize(width: input.width, height: textView.frame.height))
         }
         let containerSize = NSSize(
-            width: width,
+            width: input.width,
             height: CGFloat.greatestFiniteMagnitude
         )
         if textContainer.containerSize != containerSize {
             textContainer.containerSize = containerSize
         }
+        let font = textView.font ?? .preferredFont(forTextStyle: .body)
         let nextHeight = ComposerHeightCalculator.height(
-            for: textView.string,
-            width: width,
+            for: input.text,
+            width: input.width,
             font: font
         )
-        lastMeasurement = Measurement(
-            text: textView.string,
-            width: width,
-            fontName: font.fontName,
-            fontSize: font.pointSize,
-            height: nextHeight
-        )
+        guard measurementState.commit(request, height: nextHeight) else { return false }
         apply(height: nextHeight, to: heightBinding)
+        return true
     }
 
     private func apply(height: CGFloat, to heightBinding: Binding<CGFloat>) {

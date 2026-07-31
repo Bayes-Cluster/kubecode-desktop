@@ -1807,26 +1807,14 @@ struct ContentView: View {
         .kubecodeComposerGlass(
             in: RoundedRectangle(cornerRadius: 28, style: .continuous)
         )
-        .animation(
-            .easeInOut(duration: ComposerPresentationMetrics.transitionDuration),
-            value: sessionWorkspace.composerHeight
-        )
-        .animation(
-            .easeInOut(duration: ComposerPresentationMetrics.transitionDuration),
-            value: composerUsesExpandedLayout
-        )
         .onChange(of: sessionWorkspace.composerHeight) { _, height in
             let shouldExpand = height > ComposerHeightCalculator.minimumHeight + 0.5
             guard shouldExpand != sessionWorkspace.composerIsExpanded else { return }
-            withAnimation(.easeInOut(duration: ComposerPresentationMetrics.transitionDuration)) {
-                sessionWorkspace.composerIsExpanded = shouldExpand
-            }
+            sessionWorkspace.composerIsExpanded = shouldExpand
         }
         .onChange(of: model.composer) { _, value in
             guard value.isEmpty, sessionWorkspace.composerIsExpanded else { return }
-            withAnimation(.easeInOut(duration: ComposerPresentationMetrics.transitionDuration)) {
-                sessionWorkspace.composerIsExpanded = false
-            }
+            sessionWorkspace.composerIsExpanded = false
         }
     }
 
