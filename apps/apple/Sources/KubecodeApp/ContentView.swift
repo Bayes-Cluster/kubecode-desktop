@@ -150,6 +150,8 @@ private struct ComposerOverlayHeightKey: PreferenceKey {
 private struct TranscriptViewport: View {
     let entries: [TranscriptSurfaceEntry]
     let sessionID: String?
+    let renderScope: AgentMarkdownRenderScope
+    let renderStore: AgentMarkdownRenderStore
     let outputRevision: String
     let bottomInset: CGFloat
     let scrollController: TranscriptScrollController
@@ -158,6 +160,7 @@ private struct TranscriptViewport: View {
     let rowBuilder: (TranscriptSurfaceEntry) -> AnyView
 
     var body: some View {
+        let rowIDs = entries.map(\.id)
         NativeTranscriptCollectionView(
             items: entries.map { entry in
                 return NativeTranscriptItem(
@@ -175,6 +178,18 @@ private struct TranscriptViewport: View {
         ) { index in
             guard entries.indices.contains(index) else { return AnyView(EmptyView()) }
             return rowBuilder(entries[index])
+        }
+        .onAppear {
+            renderStore.reconcile(scope: renderScope, retainingRowIDs: Set(rowIDs))
+        }
+        .onChange(of: renderScope) { _, scope in
+            renderStore.reconcile(scope: scope, retainingRowIDs: Set(rowIDs))
+        }
+        .onChange(of: rowIDs) { _, ids in
+            renderStore.reconcile(scope: renderScope, retainingRowIDs: Set(ids))
+        }
+        .onDisappear {
+            renderStore.remove(scope: renderScope)
         }
     }
 }
@@ -1649,6 +1664,11 @@ struct ContentView: View {
                 TranscriptViewport(
                     entries: transcriptSurfaceEntries,
                     sessionID: model.selectedConversationID,
+                    renderScope: AgentMarkdownRenderScope(
+                        projectIdentity: model.markdownProjectResourceContext?.identity,
+                        sessionID: model.selectedConversationID
+                    ),
+                    renderStore: sessionWorkspace.markdownRenderStore,
                     outputRevision: transcriptScrollMarker,
                     bottomInset: transcriptBottomClearance,
                     scrollController: sessionWorkspace.transcriptScrollController,
@@ -2343,7 +2363,9 @@ struct ContentView: View {
                 AgentMarkdownView(
                     source: item.text,
                     tone: .secondary,
-                    isStreaming: isCurrent
+                    isStreaming: isCurrent,
+                    renderItemID: item.id,
+                    renderSegment: .activityUpdate
                 )
                     .frame(maxWidth: 720, alignment: .leading)
             }
@@ -2373,7 +2395,9 @@ struct ContentView: View {
         case .agent:
             AgentMarkdownView(
                 source: item.text,
-                copyResponseSource: item.text
+                copyResponseSource: item.text,
+                renderItemID: item.id,
+                renderSegment: .agentResponse
             )
             .frame(maxWidth: 760, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -3561,7 +3585,7 @@ private struct UserMessageBubble: View {
     let source: String
 
     var body: some View {
-        AgentMarkdownView(source: source)
+        AgentMarkdownView(source: source, renderSegment: .userMessage)
             .padding(.horizontal, UserMessageBubbleMetrics.horizontalPadding / 2)
             .padding(.vertical, 11)
             .frame(width: UserMessageBubbleMetrics.width(for: source, typography: typography), alignment: .leading)
@@ -3630,7 +3654,9 @@ private struct ThinkingTranscriptRow: View {
             AgentMarkdownView(
                 source: item.text,
                 tone: .secondary,
-                isStreaming: isCurrent
+                isStreaming: isCurrent,
+                renderItemID: item.id,
+                renderSegment: .thinking
             )
                 .font(.callout)
                 .frame(maxWidth: 720, alignment: .leading)

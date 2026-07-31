@@ -205,6 +205,319 @@ struct PreparedMarkdownRendererTests {
         #expect(store.heightCommit(rowID: "output", width: 420, verticalInset: 4) === first)
     }
 
+    @Test @MainActor func offscreen_reconfigure_reappear_retains_the_semantic_session_and_commit() async throws {
+        let counter = MarkdownDocumentBuildCounter()
+        let store = AgentMarkdownRenderStore(documentBuilder: counter.build)
+        let identity = markdownIdentity(rowID: "response-42", segment: .agentResponse)
+
+        _ = store.submit(
+            identity: identity,
+            source: "Stable **prepared** response",
+            typography: typography,
+            tone: .primary
+        )
+        try await waitUntil { store.latestRenderCommit(identity: identity) != nil }
+        let session = try #require(store.testingSession(identity: identity))
+        let commit = try #require(store.latestRenderCommit(identity: identity))
+        let preparationCount = session.preparationCount
+
+        let visibleHost = NativeSelectableAgentMarkdownView.Coordinator()
+        let visibleTextView = NativeAgentMarkdownTextView(frame: .zero)
+        visibleHost.receivePreparedCommit(commit, isAuthoritative: true, to: visibleTextView)
+
+        let reappearedHost = NativeSelectableAgentMarkdownView.Coordinator()
+        let reappearedTextView = NativeAgentMarkdownTextView(frame: .zero)
+        reappearedHost.receivePreparedCommit(commit, isAuthoritative: true, to: reappearedTextView)
+        let repeated = store.submit(
+            identity: identity,
+            source: "Stable **prepared** response",
+            typography: typography,
+            tone: .primary
+        )
+
+        #expect(repeated == .unchanged(contentVersion: 1))
+        #expect(store.testingSession(identity: identity) === session)
+        #expect(store.latestRenderCommit(identity: identity) === commit)
+        #expect(counter.count == 1)
+        #expect(session.preparationCount == preparationCount)
+        #expect(visibleTextView.string == reappearedTextView.string)
+    }
+
+    @Test @MainActor func identical_input_is_inert_across_render_apply_measure_and_height_publication() async throws {
+        let counter = MarkdownDocumentBuildCounter()
+        let store = AgentMarkdownRenderStore(documentBuilder: counter.build)
+        let identity = markdownIdentity(rowID: "terminal", segment: .runOutput)
+        let coordinator = NativeSelectableAgentMarkdownView.Coordinator()
+        let textView = NativeAgentMarkdownTextView(frame: .zero)
+
+        _ = store.submit(
+            identity: identity,
+            source: "Same **terminal** source",
+            typography: typography,
+            tone: .primary
+        )
+        try await waitUntil { store.latestRenderCommit(identity: identity) != nil }
+        let session = try #require(store.testingSession(identity: identity))
+        let commit = try #require(store.latestRenderCommit(identity: identity))
+        coordinator.receivePreparedCommit(commit, isAuthoritative: true, to: textView)
+        let measured = try #require(store.heightCommit(
+            identity: identity,
+            width: 420,
+            verticalInset: 4
+        ))
+        #expect(coordinator.shouldPublishHeight(measured, identity: identity))
+
+        let parseCount = counter.count
+        let preparationCount = session.preparationCount
+        let applyCount = coordinator.preparedApplyCount
+        let measurementCount = store.testingMeasurementCount
+        let repeated = store.submit(
+            identity: identity,
+            source: "Same **terminal** source",
+            typography: typography,
+            tone: .primary
+        )
+        coordinator.receivePreparedCommit(commit, isAuthoritative: true, to: textView)
+
+        #expect(repeated == .unchanged(contentVersion: 1))
+        #expect(store.heightCommit(identity: identity, width: 420, verticalInset: 4) === measured)
+        #expect(!coordinator.shouldPublishHeight(measured, identity: identity))
+        #expect(counter.count == parseCount)
+        #expect(session.preparationCount == preparationCount)
+        #expect(coordinator.preparedApplyCount == applyCount)
+        #expect(store.testingMeasurementCount == measurementCount)
+        #expect(coordinator.shouldPublishHeight(
+            measured,
+            identity: markdownIdentity(rowID: "other", segment: .runOutput)
+        ))
+    }
+
+    @Test @MainActor func width_only_change_measures_the_existing_commit_without_parse_or_render() async throws {
+        let counter = MarkdownDocumentBuildCounter()
+        let store = AgentMarkdownRenderStore(documentBuilder: counter.build)
+        let identity = markdownIdentity(rowID: "wrapping", segment: .agentResponse)
+
+        _ = store.submit(
+            identity: identity,
+            source: String(repeating: "A wrapping **Markdown** response. ", count: 20),
+            typography: typography,
+            tone: .primary
+        )
+        try await waitUntil { store.latestRenderCommit(identity: identity) != nil }
+        let session = try #require(store.testingSession(identity: identity))
+        let commit = try #require(store.latestRenderCommit(identity: identity))
+        let narrow = try #require(store.heightCommit(identity: identity, width: 320, verticalInset: 4))
+        let parseCount = counter.count
+        let preparationCount = session.preparationCount
+
+        let wide = try #require(store.heightCommit(identity: identity, width: 720, verticalInset: 4))
+
+        #expect(narrow !== wide)
+        #expect(narrow.renderCommit === commit)
+        #expect(wide.renderCommit === commit)
+        #expect(wide.height < narrow.height)
+        #expect(counter.count == parseCount)
+        #expect(session.preparationCount == preparationCount)
+    }
+
+    @Test @MainActor func semantic_identity_does_not_alias_projects_sessions_rows_or_segments() async throws {
+        let store = AgentMarkdownRenderStore()
+        let base = markdownIdentity(rowID: "shared-id", segment: .agentResponse)
+        let sibling = markdownIdentity(rowID: "shared-id", segment: .thinking)
+        let otherSession = AgentMarkdownRenderIdentity(
+            scope: .init(projectIdentity: "project-a", sessionID: "session-b"),
+            rowID: "shared-id",
+            segment: .agentResponse
+        )
+        let otherProject = AgentMarkdownRenderIdentity(
+            scope: .init(projectIdentity: "project-b", sessionID: "session-a"),
+            rowID: "shared-id",
+            segment: .agentResponse
+        )
+
+        #expect(Set([base, sibling, otherSession, otherProject]).count == 4)
+
+        _ = store.submit(
+            identity: base,
+            source: "Agent response",
+            typography: typography,
+            tone: .primary
+        )
+        _ = store.submit(
+            identity: sibling,
+            source: "Thinking response",
+            typography: typography,
+            tone: .secondary
+        )
+        try await waitUntil {
+            store.latestRenderCommit(identity: base) != nil
+                && store.latestRenderCommit(identity: sibling) != nil
+        }
+
+        #expect(store.testingSession(identity: base) !== store.testingSession(identity: sibling))
+
+        _ = store.submit(
+            identity: otherSession,
+            source: "Other session",
+            typography: typography,
+            tone: .primary
+        )
+        #expect(store.testingIdentities == Set([otherSession]))
+
+        _ = store.submit(
+            identity: otherProject,
+            source: "Other project",
+            typography: typography,
+            tone: .primary
+        )
+        #expect(store.testingIdentities == Set([otherProject]))
+    }
+
+    @Test @MainActor func inserted_prefix_and_repeated_siblings_do_not_reuse_positional_blocks() {
+        let originalDocument = StreamingMarkdownDocument(source: "Same paragraph.\n\nSame paragraph.")
+        let original = commit(
+            document: originalDocument,
+            generation: 1,
+            contentVersion: 1
+        )
+        let insertedDocument = StreamingMarkdownDocument(
+            source: "Inserted paragraph.\n\nSame paragraph.\n\nSame paragraph.",
+            previous: originalDocument
+        )
+        let inserted = commit(
+            document: insertedDocument,
+            generation: 2,
+            contentVersion: 2,
+            previous: original
+        )
+
+        #expect(insertedDocument.stablePrefixCount == 0)
+        #expect(inserted.isFullReplacement)
+        #expect(inserted.blocks[1].attributedValue !== original.blocks[0].attributedValue)
+        #expect(inserted.blocks[2].attributedValue !== original.blocks[1].attributedValue)
+        #expect(inserted.document.preparedBlocks[1].sourceRange
+            != original.document.preparedBlocks[0].sourceRange)
+    }
+
+    @Test @MainActor func repeated_same_kind_children_survive_prefix_insertion_and_reordering() async throws {
+        let counter = MarkdownDocumentBuildCounter()
+        let store = AgentMarkdownRenderStore(documentBuilder: counter.build)
+        let parentRowID = "run-1-activity-details"
+        let first = markdownIdentity(
+            rowID: parentRowID,
+            semanticItemID: "thinking-a",
+            segment: .thinking
+        )
+        let second = markdownIdentity(
+            rowID: parentRowID,
+            semanticItemID: "thinking-b",
+            segment: .thinking
+        )
+
+        _ = store.submit(identity: first, source: "First thought", typography: typography, tone: .secondary)
+        _ = store.submit(identity: second, source: "Second thought", typography: typography, tone: .secondary)
+        try await waitUntil {
+            store.latestRenderCommit(identity: first) != nil
+                && store.latestRenderCommit(identity: second) != nil
+        }
+        let firstSession = try #require(store.testingSession(identity: first))
+        let secondSession = try #require(store.testingSession(identity: second))
+        let firstCommit = try #require(store.latestRenderCommit(identity: first))
+        let secondCommit = try #require(store.latestRenderCommit(identity: second))
+
+        #expect(firstSession !== secondSession)
+        #expect(firstCommit !== secondCommit)
+
+        let prefix = markdownIdentity(
+            rowID: parentRowID,
+            semanticItemID: "thinking-prefix",
+            segment: .thinking
+        )
+        _ = store.submit(identity: prefix, source: "Prefixed thought", typography: typography, tone: .secondary)
+        try await waitUntil { store.latestRenderCommit(identity: prefix) != nil }
+
+        // Re-reading in presentation order models prefix insertion followed by sibling reorder.
+        for identity in [second, prefix, first] {
+            _ = store.latestRenderCommit(identity: identity)
+        }
+        store.reconcile(scope: first.scope, retainingRowIDs: [parentRowID])
+
+        #expect(store.testingSession(identity: first) === firstSession)
+        #expect(store.testingSession(identity: second) === secondSession)
+        #expect(store.latestRenderCommit(identity: first) === firstCommit)
+        #expect(store.latestRenderCommit(identity: second) === secondCommit)
+        #expect(store.testingIdentities == Set([first, second, prefix]))
+        #expect(counter.count == 3)
+
+        store.reconcile(scope: first.scope, retainingRowIDs: [])
+        #expect(store.testingIdentities.isEmpty)
+    }
+
+    @Test @MainActor func row_store_capacity_and_lru_eviction_are_deterministic() {
+        let store = AgentMarkdownRenderStore(capacity: 2)
+        let first = markdownIdentity(rowID: "first", segment: .agentResponse)
+        let second = markdownIdentity(rowID: "second", segment: .agentResponse)
+        let third = markdownIdentity(rowID: "third", segment: .agentResponse)
+
+        _ = store.submit(identity: first, source: "First", typography: typography, tone: .primary)
+        _ = store.submit(identity: second, source: "Second", typography: typography, tone: .primary)
+        _ = store.latestRenderCommit(identity: first)
+        _ = store.submit(identity: third, source: "Third", typography: typography, tone: .primary)
+
+        #expect(store.testingIdentities == Set([first, third]))
+        #expect(store.testingSession(identity: second) == nil)
+    }
+
+    @Test @MainActor func width_cache_capacity_and_lru_eviction_are_deterministic() async throws {
+        let store = AgentMarkdownRenderStore(heightCapacityPerRow: 2)
+        let identity = markdownIdentity(rowID: "bounded-widths", segment: .agentResponse)
+
+        _ = store.submit(
+            identity: identity,
+            source: String(repeating: "Width-sensitive Markdown. ", count: 12),
+            typography: typography,
+            tone: .primary
+        )
+        try await waitUntil { store.latestRenderCommit(identity: identity) != nil }
+        let first = try #require(store.heightCommit(identity: identity, width: 320, verticalInset: 4))
+        let second = try #require(store.heightCommit(identity: identity, width: 480, verticalInset: 4))
+        #expect(store.heightCommit(identity: identity, width: 320, verticalInset: 4) === first)
+        let third = try #require(store.heightCommit(identity: identity, width: 720, verticalInset: 4))
+
+        #expect(store.testingHeightKeys(identity: identity) == [first.key, third.key])
+        #expect(store.heightCommit(identity: identity, width: 480, verticalInset: 4) !== second)
+        #expect(store.testingMeasurementCount == 4)
+    }
+
+    @Test @MainActor func row_and_scope_teardown_cancel_stale_completion_and_release_sessions() async {
+        let scheduler = ManualPreparedDocumentScheduler()
+        let store = AgentMarkdownRenderStore(documentScheduler: scheduler.schedule)
+        let first = markdownIdentity(rowID: "first", segment: .agentResponse)
+        let second = markdownIdentity(rowID: "second", segment: .agentResponse)
+
+        _ = store.submit(identity: first, source: "First", typography: typography, tone: .primary)
+        _ = store.submit(identity: second, source: "Second", typography: typography, tone: .primary)
+        let releasedSession = WeakMarkdownRenderSession(
+            store.testingSession(identity: first)
+        )
+
+        store.reconcile(scope: first.scope, retainingRowIDs: ["second"])
+        await scheduler.release(0)
+        await scheduler.tasks[0].value
+
+        #expect(releasedSession.value == nil)
+        #expect(store.latestRenderCommit(identity: first) == nil)
+        #expect(store.testingIdentities == Set([second]))
+
+        let replacementScope = AgentMarkdownRenderScope(
+            projectIdentity: "project-b",
+            sessionID: "session-b"
+        )
+        store.reconcile(scope: replacementScope, retainingRowIDs: [])
+
+        #expect(store.testingIdentities.isEmpty)
+    }
+
     @Test @MainActor func resolved_attachment_publishes_exactly_one_newer_render_height_commit() async throws {
         let bitmap = try #require(NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -1057,6 +1370,19 @@ struct PreparedMarkdownRendererTests {
         )
     }
 
+    private func markdownIdentity(
+        rowID: String,
+        semanticItemID: String? = nil,
+        segment: AgentMarkdownRenderSegment
+    ) -> AgentMarkdownRenderIdentity {
+        AgentMarkdownRenderIdentity(
+            scope: .init(projectIdentity: "project-a", sessionID: "session-a"),
+            rowID: rowID,
+            semanticItemID: semanticItemID,
+            segment: segment
+        )
+    }
+
     private func imageData() throws -> Data {
         let bitmap = try #require(NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -1115,6 +1441,15 @@ private final class PreparedCommitRecorder {
 
     func record(_ commit: AgentMarkdownRenderCommit) {
         commits.append(commit)
+    }
+}
+
+@MainActor
+private final class WeakMarkdownRenderSession {
+    weak var value: AgentMarkdownRenderSession?
+
+    init(_ value: AgentMarkdownRenderSession?) {
+        self.value = value
     }
 }
 

@@ -177,7 +177,7 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
     let resourceContext: MarkdownProjectResourceContext?
     let preparedCommit: AgentMarkdownRenderCommit?
     let renderStore: AgentMarkdownRenderStore?
-    let renderRowID: String?
+    let renderIdentity: AgentMarkdownRenderIdentity?
     let onRenderHeight: ((AgentMarkdownRenderHeightCommit) -> Void)?
 
     init(
@@ -189,7 +189,7 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         resourceContext: MarkdownProjectResourceContext? = nil,
         preparedCommit: AgentMarkdownRenderCommit? = nil,
         renderStore: AgentMarkdownRenderStore? = nil,
-        renderRowID: String? = nil,
+        renderIdentity: AgentMarkdownRenderIdentity? = nil,
         onRenderHeight: ((AgentMarkdownRenderHeightCommit) -> Void)? = nil
     ) {
         self.source = source
@@ -200,7 +200,7 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         self.resourceContext = resourceContext
         self.preparedCommit = preparedCommit
         self.renderStore = renderStore
-        self.renderRowID = renderRowID
+        self.renderIdentity = renderIdentity
         self.onRenderHeight = onRenderHeight
     }
 
@@ -213,6 +213,9 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         private var measuredHeight: CGFloat?
         private var measuredSource: String?
         private var measuredResourceIdentity: String?
+        private var publishedHeightIdentity: AgentMarkdownRenderIdentity?
+        private var publishedHeightKey: AgentMarkdownRenderKey?
+        private var publishedHeight: CGFloat?
         private(set) var renderCount = 0
         private(set) var applyCount = 0
         private(set) var preparedRenderCount = 0
@@ -287,6 +290,22 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         func measurementCommit(forSource source: String) -> AgentMarkdownRenderCommit? {
             guard latestPreparedCommit?.source == source else { return nil }
             return latestPreparedCommit
+        }
+
+        func shouldPublishHeight(
+            _ commit: AgentMarkdownRenderHeightCommit,
+            identity: AgentMarkdownRenderIdentity
+        ) -> Bool {
+            guard publishedHeightIdentity != identity
+                || publishedHeightKey != commit.key
+                || publishedHeight != commit.height
+            else {
+                return false
+            }
+            publishedHeightIdentity = identity
+            publishedHeightKey = commit.key
+            publishedHeight = commit.height
+            return true
         }
 
         func renderedUpdate(
@@ -382,16 +401,18 @@ struct NativeSelectableAgentMarkdownView: NSViewRepresentable {
         )
         guard context.coordinator.measurementCommit(forSource: source) != nil,
               let renderStore,
-              let renderRowID,
+              let renderIdentity,
               let measured = renderStore.heightCommit(
-                rowID: renderRowID,
+                identity: renderIdentity,
                 width: width,
                 verticalInset: textView.textContainerInset.height
               )
         else {
             return nil
         }
-        onRenderHeight?(measured)
+        if context.coordinator.shouldPublishHeight(measured, identity: renderIdentity) {
+            onRenderHeight?(measured)
+        }
         return CGSize(width: measured.key.effectiveWidth, height: measured.height)
     }
 
