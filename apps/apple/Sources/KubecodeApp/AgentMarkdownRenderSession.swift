@@ -14,6 +14,8 @@ final class AgentMarkdownRenderSession {
         let typography: WorkspaceTypography
         let tone: AgentMarkdownTone
         let resourceIdentity: String?
+        let styleRevision: Int
+        let resourceGeneration: Int
     }
 
     @ObservationIgnored private let documentBuilder: StreamingMarkdownSession.Builder
@@ -23,6 +25,7 @@ final class AgentMarkdownRenderSession {
     @ObservationIgnored private var latestStyle: Style?
     @ObservationIgnored private var latestReceivedGeneration: Int?
     @ObservationIgnored private var latestReceivedContentVersion = 0
+    @ObservationIgnored private var latestRenderRequestToken = 0
     @ObservationIgnored private var renderTask: Task<Void, Never>?
     @ObservationIgnored private var nextAutomaticGeneration = 1
     @ObservationIgnored private var isCancelled = false
@@ -36,7 +39,9 @@ final class AgentMarkdownRenderSession {
                 snapshot,
                 typography: style.typography,
                 tone: style.tone,
-                resourceIdentity: style.resourceIdentity
+                resourceIdentity: style.resourceIdentity,
+                styleRevision: style.styleRevision,
+                resourceGeneration: style.resourceGeneration
             )
         }
     )
@@ -70,7 +75,9 @@ final class AgentMarkdownRenderSession {
         source: String,
         typography: WorkspaceTypography,
         tone: AgentMarkdownTone,
-        resourceIdentity: String? = nil
+        resourceIdentity: String? = nil,
+        styleRevision: Int = 0,
+        resourceGeneration: Int = 0
     ) -> StreamingMarkdownSession.SubmissionResult {
         let generation = nextAutomaticGeneration
         nextAutomaticGeneration += 1
@@ -79,7 +86,9 @@ final class AgentMarkdownRenderSession {
             generation: generation,
             typography: typography,
             tone: tone,
-            resourceIdentity: resourceIdentity
+            resourceIdentity: resourceIdentity,
+            styleRevision: styleRevision,
+            resourceGeneration: resourceGeneration
         )
     }
 
@@ -89,13 +98,17 @@ final class AgentMarkdownRenderSession {
         generation: Int,
         typography: WorkspaceTypography,
         tone: AgentMarkdownTone,
-        resourceIdentity: String? = nil
+        resourceIdentity: String? = nil,
+        styleRevision: Int = 0,
+        resourceGeneration: Int = 0
     ) -> StreamingMarkdownSession.SubmissionResult {
         nextAutomaticGeneration = max(nextAutomaticGeneration, generation + 1)
         let style = Style(
             typography: typography,
             tone: tone,
-            resourceIdentity: resourceIdentity
+            resourceIdentity: resourceIdentity,
+            styleRevision: styleRevision,
+            resourceGeneration: resourceGeneration
         )
         let previousStyle = latestStyle
         latestStyle = style
@@ -109,6 +122,8 @@ final class AgentMarkdownRenderSession {
                 typography: typography,
                 tone: tone,
                 resourceIdentity: resourceIdentity,
+                styleRevision: styleRevision,
+                resourceGeneration: resourceGeneration,
                 forceStyleRefresh: true
             )
         }
@@ -120,6 +135,8 @@ final class AgentMarkdownRenderSession {
         typography: WorkspaceTypography,
         tone: AgentMarkdownTone,
         resourceIdentity: String? = nil,
+        styleRevision: Int = 0,
+        resourceGeneration: Int = 0,
         forceStyleRefresh: Bool = false
     ) {
         guard !isCancelled,
@@ -130,12 +147,15 @@ final class AgentMarkdownRenderSession {
 
         latestReceivedGeneration = snapshot.generation
         latestReceivedContentVersion = snapshot.contentVersion
+        latestRenderRequestToken &+= 1
+        let expectedRequestToken = latestRenderRequestToken
         let expectedGeneration = snapshot.generation
         let expectedContentVersion = snapshot.contentVersion
         let previous = latestCommit
         renderTask = renderScheduler { [weak self] in
             guard let self,
                   !self.isCancelled,
+                  self.latestRenderRequestToken == expectedRequestToken,
                   self.latestReceivedGeneration == expectedGeneration,
                   self.latestReceivedContentVersion == expectedContentVersion
             else { return }
@@ -144,11 +164,15 @@ final class AgentMarkdownRenderSession {
                 snapshot: snapshot,
                 previous: previous,
                 typography: typography,
-                tone: tone
+                tone: tone,
+                styleRevision: styleRevision,
+                resourceIdentity: resourceIdentity,
+                resourceGeneration: resourceGeneration
             )
             self.preparationCount += 1
 
             guard !self.isCancelled,
+                  self.latestRenderRequestToken == expectedRequestToken,
                   self.latestReceivedGeneration == expectedGeneration,
                   self.latestReceivedContentVersion == expectedContentVersion
             else { return }

@@ -16,6 +16,7 @@ final class SessionWorkspaceModel {
     var composerPalettePresented = false
     var composerReferencePickerPresented = false
     let transcriptScrollController = TranscriptScrollController()
+    let markdownRenderStore = AgentMarkdownRenderStore()
     let autosaveScheduler = DocumentAutosaveScheduler()
     private var transcriptExpansionOverrides: [String: Bool] = [:]
     private var transcriptExpansionOrder: [String] = []
@@ -79,6 +80,11 @@ final class SessionWorkspaceModel {
 
     func disconnect() {
         autosaveScheduler.cancelAll()
+        markdownRenderStore.removeAll()
+    }
+
+    func invalidateMarkdownResources(identity: String) {
+        markdownRenderStore.invalidateResourceContext(identity: identity)
     }
 
     private func transcriptExpansionKey(sessionID: String?, itemID: String) -> String {

@@ -1591,7 +1591,13 @@ struct ContentView: View {
                         )
                     }
                 ) { entry in
-                    AnyView(transcriptSurfaceRow(entry))
+                    AnyView(
+                        transcriptSurfaceRow(entry)
+                            .environment(
+                                \.agentMarkdownRenderStore,
+                                sessionWorkspace.markdownRenderStore
+                            )
+                    )
                 }
 
                 TranscriptJumpToLatestButton(

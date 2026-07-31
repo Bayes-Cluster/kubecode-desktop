@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftMath
 import KubecodeMarkdown
+import KubecodeMacUI
 
 #if os(macOS)
 import AppKit
@@ -8,11 +9,15 @@ import AppKit
 struct AgentMarkdownView: View {
     @Environment(\.workspaceTypography) private var typography
     @Environment(\.markdownProjectResourceContext) private var resourceContext
+    @Environment(\.nativeTranscriptRowRenderContext) private var rowRenderContext
+    @Environment(\.agentMarkdownRenderStore) private var sharedRenderStore
+    @Environment(\.colorScheme) private var colorScheme
     private let source: String
     private let tone: AgentMarkdownTone
     private let copyResponseSource: String?
     private let isStreaming: Bool
-    @State private var renderSession = AgentMarkdownRenderSession()
+    @State private var localRenderStore = AgentMarkdownRenderStore()
+    @State private var localRowID = UUID().uuidString
 
     init(
         source: String,
@@ -27,11 +32,15 @@ struct AgentMarkdownView: View {
     }
 
     var body: some View {
+        let renderStore = sharedRenderStore ?? localRenderStore
+        let rowID = rowRenderContext?.itemID ?? localRowID
+        let preparedCommit = renderStore.latestRenderCommit(rowID: rowID)
         let input = AgentMarkdownRenderInput(
             source: source,
             typography: typography,
             tone: tone,
             resourceIdentity: resourceContext?.identity,
+            styleIdentity: colorScheme == .dark ? 1 : 0,
             isStreaming: isStreaming
         )
         NativeSelectableAgentMarkdownView(
@@ -41,19 +50,41 @@ struct AgentMarkdownView: View {
             copyResponseSource: copyResponseSource,
             isStreaming: isStreaming,
             resourceContext: resourceContext,
-            preparedCommit: renderSession.latestCommit
+            preparedCommit: preparedCommit,
+            renderStore: renderStore,
+            renderRowID: rowID,
+            onRenderHeight: { measured in
+                guard let rowRenderContext else { return }
+                let value = NativeTranscriptRenderHeightValue(
+                    key: NativeTranscriptRenderHeightKey(
+                        contentVersion: measured.key.contentVersion,
+                        renderPublicationVersion: measured.key.renderPublicationVersion,
+                        effectiveWidth: measured.key.effectiveWidth
+                    ),
+                    height: measured.height
+                )
+                Task { @MainActor in rowRenderContext.publish(value) }
+            }
         )
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onAppear { submit(input) }
-        .onChange(of: input) { _, value in submit(value) }
+        .onAppear { submit(input, rowID: rowID, store: renderStore) }
+        .onChange(of: input) { _, value in
+            submit(value, rowID: rowID, store: renderStore)
+        }
     }
 
-    private func submit(_ input: AgentMarkdownRenderInput) {
-        _ = renderSession.submit(
+    private func submit(
+        _ input: AgentMarkdownRenderInput,
+        rowID: String,
+        store: AgentMarkdownRenderStore
+    ) {
+        _ = store.submit(
+            rowID: rowID,
             source: input.source,
             typography: input.typography,
             tone: input.tone,
-            resourceIdentity: input.resourceIdentity
+            styleIdentity: input.styleIdentity,
+            resourceContext: resourceContext
         )
     }
 }
@@ -63,6 +94,7 @@ private struct AgentMarkdownRenderInput: Equatable {
     let typography: WorkspaceTypography
     let tone: AgentMarkdownTone
     let resourceIdentity: String?
+    let styleIdentity: Int
     let isStreaming: Bool
 }
 
@@ -70,10 +102,20 @@ private struct MarkdownProjectResourceContextKey: EnvironmentKey {
     static let defaultValue: MarkdownProjectResourceContext? = nil
 }
 
+private struct AgentMarkdownRenderStoreKey: EnvironmentKey {
+    static let defaultValue: AgentMarkdownRenderStore? = nil
+}
+
 extension EnvironmentValues {
     var markdownProjectResourceContext: MarkdownProjectResourceContext? {
         get { self[MarkdownProjectResourceContextKey.self] }
         set { self[MarkdownProjectResourceContextKey.self] = newValue }
+    }
+
+
+    var agentMarkdownRenderStore: AgentMarkdownRenderStore? {
+        get { self[AgentMarkdownRenderStoreKey.self] }
+        set { self[AgentMarkdownRenderStoreKey.self] = newValue }
     }
 }
 
